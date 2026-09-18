@@ -1,0 +1,29 @@
+# --- результаты работы программы (не коммитим) ---
+result/
+temp/
+
+# --- устанавливаемые компоненты: ffmpeg и нейросеть (качаются отдельно) ---
+tools/
+apps/
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.part
+.venv/
+
+# --- pyinstaller (если собирать exe) ---
+build/
+dist/
+*.spec
+
+# --- мусор ОС/редакторов ---
+Thumbs.db
+Desktop.ini
+.DS_Store
+.idea/
+.vscode/
+
+# дистрибутив-артефакты: их место в Releases, не в репозитории
+assets/
+*.bundle
