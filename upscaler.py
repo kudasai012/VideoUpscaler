@@ -1,1779 +1,1536 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Video Upscaler — original-style console, bounded cache, playable growing MP4.
+Python >= 3.9. Runtime dependencies: FFmpeg + FFprobe; AI: Real-ESRGAN ncnn Vulkan.
+No pip dependencies. See README.md for guarantees and limitations.
 """
-================================================================================
-  ВИДЕО-АПСЕЙЛЕР  ·  Video Upscaler  ·  100% бесплатно, без регистрации
-================================================================================
-Улучшает качество видео и поднимает разрешение вплоть до 4K / 8K.
-
-Два движка:
-  [1] БЫСТРЫЙ  — ffmpeg: lanczos/spline-апскейл + шумодав + резкость + цвет.
-                 Работает на любом ПК, очень быстро.
-  [2] AI       — Real-ESRGAN (нейросеть): реально дорисовывает детали.
-                 Максимальное качество, но нужна видеокарта (Vulkan) для
-                 вменяемой скорости. Модель скачивается один раз, бесплатно.
-
-Запуск:      python upscaler.py
-Без меню:    python upscaler.py "C:\video\film.mp4" --target 4k --engine ai
-================================================================================
-"""
-
 from __future__ import annotations
 
 import argparse
-import atexit
+import contextlib
+from fractions import Fraction
 import json
+import math
 import os
+from pathlib import Path
 import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
+import tempfile
 import threading
+import copy
 import time
+import urllib.request
+import unicodedata
 import zipfile
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
-# ----------------------------------------------------------------------------- #
-#  Настройка консоли (Windows + UTF-8 + цвета)
-# ----------------------------------------------------------------------------- #
-IS_WIN = os.name == "nt"
-BASE_DIR = Path(__file__).resolve().parent
-TOOLS_DIR = BASE_DIR / "tools"
-ASSETS_DIR = BASE_DIR / "assets"
-APPS_DIR = BASE_DIR / "apps"
-TEMP_ROOT = BASE_DIR / "temp"
-RESULT_DIR = BASE_DIR / "result"          # сюда складываются готовые видео
+__version__ = '1.0.1'
+BASE = Path(__file__).resolve().parent
+WIN = os.name == 'nt'
+EXTS = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.m4v', '.mpg', '.mpeg',
+        '.ts', '.flv', '.wmv', '.3gp', '.vob', '.mts', '.m2ts', '.ogv'}
+TARGETS = {'720': (1280, 720), '1080': (1920, 1080), '1440': (2560, 1440),
+           '4k': (3840, 2160), '8k': (7680, 4320)}
+MODELS = {'general': ('realesrgan-x4plus', (4,)),
+          'anime': ('realesrgan-x4plus-anime', (4,)),
+          'fast': ('realesr-animevideov3', (2, 3, 4))}
+PRESETS = {'soft': (0, 0), 'balanced': (0.6, 0.45),
+           'max': (1.3, 0.75), 'restore': (2.4, 0.45)}
+PNG_SIG = b'\x89PNG\r\n\x1a\n'
+MIB = 1024 ** 2
+GIB = 1024 ** 3
+ACTIVE = set()
+_ACTIVE_PROGRESS = None
+_OUTPUT_LOCK = threading.RLock()
 
 
-def purge_temp() -> None:
-    """Полностью вычищает временную папку программы (включая саму папку).
-
-    Вызывается после каждой AI-обработки, при завершении программы
-    и при старте (убирает остатки от аварийно прерванных запусков).
-    """
-    if not TEMP_ROOT.is_dir():
+def say(s):
+    progress = _ACTIVE_PROGRESS
+    if progress is not None and not progress.closed:
+        progress.notice(s)
         return
-    for sub in list(TEMP_ROOT.iterdir()):
+    with _OUTPUT_LOCK:
+        print(s, flush=True)
+
+
+def stop(p):
+    if p.poll() is None:
+        with contextlib.suppress(OSError):
+            p.terminate()
         try:
-            if sub.is_dir():
-                shutil.rmtree(sub, ignore_errors=True)
-            else:
-                sub.unlink(missing_ok=True)
-        except Exception:
-            pass
-    try:
-        if TEMP_ROOT.is_dir() and not any(TEMP_ROOT.iterdir()):
-            TEMP_ROOT.rmdir()
-    except Exception:
-        pass
-
-
-atexit.register(purge_temp)
-
-
-def _on_term(signum, frame):                      # noqa: ARG001
-    purge_temp()
-    sys.exit(143)
-
-
-for _sig in ("SIGTERM", "SIGBREAK"):
-    try:
-        signal.signal(getattr(signal, _sig), _on_term)
-    except Exception:
-        pass
-
-for _s in (sys.stdout, sys.stderr):
-    try:
-        _s.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
-
-if IS_WIN:
-    try:
-        os.system("")                      # включает VT-обработку в cmd
-        subprocess.run("chcp 65001 > nul", shell=True, check=False)
-    except Exception:
-        pass
-
-C = {
-    "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m",
-    "red": "\033[91m", "green": "\033[92m", "yellow": "\033[93m",
-    "blue": "\033[94m", "magenta": "\033[95m", "cyan": "\033[96m",
-    "white": "\033[97m",
-}
-_NO_COLOR = os.environ.get("NO_COLOR") or not sys.stdout.isatty()
-if _NO_COLOR:
-    C = {k: "" for k in C}
-
-
-def cl(text: str, *styles: str) -> str:
-    return "".join(C.get(s, "") for s in styles) + str(text) + C["reset"]
-
-
-def hr(ch: str = "─", n: int = 74, color: str = "dim") -> None:
-    print(cl(ch * n, color))
-
-
-def title(text: str) -> None:
-    hr("═")
-    print(cl(text, "bold", "cyan"))
-    hr("═")
-
-
-def ok(text: str) -> None:
-    print(f"  {cl('✓', 'green')} {text}")
-
-
-def warn(text: str) -> None:
-    print(f"  {cl('!', 'yellow')} {cl(text, 'yellow')}")
-
-
-def err(text: str) -> None:
-    print(f"  {cl('✗', 'red')} {cl(text, 'red')}")
-
-
-def info(text: str) -> None:
-    print(f"  {cl('·', 'blue')} {text}")
-
-
-VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".mpg", ".mpeg",
-              ".ts", ".flv", ".wmv", ".3gp", ".vob", ".mts", ".m2ts", ".ogv"}
-
-TARGETS: Dict[str, Tuple[int, int, str]] = {
-    "720":  (1280, 720,  "HD 720p"),
-    "1080": (1920, 1080, "Full HD 1080p"),
-    "1440": (2560, 1440, "2K QHD 1440p"),
-    "4k":   (3840, 2160, "4K UHD 2160p"),
-    "8k":   (7680, 4320, "8K UHD 4320p"),
-}
-
-# Пресеты качества для БЫСТРОГО движка
-PRESETS: Dict[str, dict] = {
-    "soft": {
-        "name": "Мягкий (естественно, без «перешарпа»)",
-        "denoise": 0, "sharpen": 0.0, "unsharp": (0, 0, 0.0),
-        "sat": 1.00, "cont": 1.00, "gamma": 1.00, "grain": 0.0,
-        "crf": 18, "slow": False,
-    },
-    "balanced": {
-        "name": "Сбалансированный  (рекомендуется)",
-        "denoise": 0.6, "sharpen": 0.5, "unsharp": (5, 5, 0.55),
-        "sat": 1.06, "cont": 1.03, "gamma": 1.00, "grain": 0.5,
-        "crf": 17, "slow": False,
-    },
-    "max": {
-        "name": "Максимальная резкость и чистота",
-        "denoise": 1.6, "sharpen": 1.2, "unsharp": (7, 7, 0.9),
-        "sat": 1.12, "cont": 1.06, "gamma": 1.00, "grain": 0.7,
-        "crf": 16, "slow": True,
-    },
-    "restore": {
-        "name": "Реставрация старого/шумного видео (VHS, DVD, камера)",
-        "denoise": 2.8, "sharpen": 0.6, "unsharp": (5, 5, 0.5),
-        "sat": 1.10, "cont": 1.05, "gamma": 1.02, "grain": 0.0,
-        "crf": 16, "slow": True, "deblock": True, "deint": True,
-    },
-}
-
-# Модели Real-ESRGAN
-AI_MODELS = {
-    "general": {
-        "name": "Универсальная — фильм/сериал/видео с камеры (лучшее качество)",
-        "model": "realesrgan-x4plus", "scales": [4], "speed": 1.0,
-    },
-    "anime": {
-        "name": "Аниме / мультфильмы (чистые линии)",
-        "model": "realesrgan-x4plus-anime", "scales": [4], "speed": 1.1,
-    },
-    "fast": {
-        "name": "Быстрая — animevideov3 (в 3-5 раз быстрее, отлично для аниме)",
-        "model": "realesr-animevideov3", "scales": [2, 3, 4], "speed": 3.5,
-    },
-}
-
-
-# ----------------------------------------------------------------------------- #
-#  Поиск / установка ffmpeg
-# ----------------------------------------------------------------------------- #
-def _which(name: str) -> Optional[str]:
-    return shutil.which(name) or shutil.which(name + ".exe")
-
-
-def _ffmpeg_search_dirs() -> List[Path]:
-    """Где искать ffmpeg: папки программы + типичные места установки."""
-    dirs: List[Path] = [TOOLS_DIR, APPS_DIR, BASE_DIR]
-    if IS_WIN:
-        env = os.environ
-        cand = [
-            Path(env.get("ProgramFiles", r"C:\Program Files")) / "ffmpeg" / "bin",
-            Path(env.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "ffmpeg" / "bin",
-            Path("C:/ffmpeg/bin"),
-            Path(env.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Links",
-            Path(env.get("ProgramData", r"C:\ProgramData")) / "chocolatey" / "bin",
-            Path(env.get("USERPROFILE", "")) / "scoop" / "shims",
-            Path(env.get("USERPROFILE", "")) / "scoop" / "apps" / "ffmpeg" / "current" / "bin",
-        ]
-        wg = Path(env.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Packages"
-        if wg.is_dir():
-            for sub in wg.glob("*ffmpeg*"):
-                for exe in list(sub.rglob("ffmpeg.exe"))[:2]:
-                    cand.append(exe.parent)
-        dirs += [c for c in cand if str(c)]
-    else:
-        dirs += [Path("/usr/local/bin"), Path("/usr/bin"), Path("/bin"),
-                 Path("/opt/homebrew/bin"), Path("/snap/bin")]
-    # рекурсивно по папкам программы: вдруг сборку распаковали куда угодно внутрь
-    for root in (TOOLS_DIR, APPS_DIR, BASE_DIR):
-        if root.is_dir():
-            for exe in root.rglob("ffmpeg.exe" if IS_WIN else "ffmpeg"):
-                dirs.append(exe.parent)
-    return dirs
-
-
-def find_ffmpeg() -> Tuple[Optional[str], Optional[str]]:
-    """Ищет ffmpeg/ffprobe: env -> папки программы -> типичные места -> PATH."""
-    names = ("ffmpeg.exe", "ffprobe.exe") if IS_WIN else ("ffmpeg", "ffprobe")
-    dirs: List[Path] = []
-    env_ff = os.environ.get("FFMPEG_PATH")
-    if env_ff:
-        p = Path(env_ff)
-        dirs.append(p if p.is_dir() else p.parent)
-    dirs += _ffmpeg_search_dirs()
-
-    full: Optional[Tuple[str, str]] = None
-    half: Optional[str] = None
-    seen = set()
-    for d in dirs:
-        key = str(d)
-        if key in seen:
-            continue
-        seen.add(key)
-        f, pr = d / names[0], d / names[1]
-        if f.is_file():
-            try:
-                os.chmod(f, 0o755)
-            except Exception:
-                pass
-            if pr.is_file():
-                full = full or (str(f), str(pr))
-            else:
-                half = half or str(f)
-    if full:
-        return full
-    wf, wp = _which("ffmpeg"), _which("ffprobe")
-    if wf and wp:
-        return wf, wp
-    if half and wp:
-        return half, wp
-    if wf:
-        return wf, None
-    if half:
-        return half, None
-    return None, None
-
-
-FFMPEG, FFPROBE = find_ffmpeg()
-
-
-# ----------------------------------------------------------------------------- #
-#  Поиск Real-ESRGAN
-# ----------------------------------------------------------------------------- #
-RES_WIN_ZIP = "realesrgan-ncnn-vulkan-20220424-windows.zip"
-RES_URLS = [
-    "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/" + RES_WIN_ZIP,
-    "https://ghproxy.net/https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/" + RES_WIN_ZIP,
-]
-RES_EXE_NAME = "realesrgan-ncnn-vulkan.exe" if IS_WIN else "realesrgan-ncnn-vulkan"
-
-
-def find_realesrgan() -> Tuple[Optional[str], Optional[str]]:
-    """Возвращает (путь_к_бинарнику, путь_к_папке_models). Учитывает ОС."""
-    env = os.environ.get("RES_PATH")
-    if env:
-        e = Path(env)
-        models = e.parent / "models" if e.is_file() else e / "models"
-        if e.exists() and models.is_dir():
-            return str(e), str(models)
-    for root in (APPS_DIR, TOOLS_DIR, ASSETS_DIR, BASE_DIR):
-        if not root.is_dir():
-            continue
-        for exe in list(root.rglob(RES_EXE_NAME)):
-            if IS_WIN and not str(exe).lower().endswith(".exe"):
-                continue
-            if not IS_WIN and str(exe).lower().endswith(".exe"):
-                continue
-            models = exe.parent / "models"
-            if not models.is_dir():
-                # модели могут лежать рядом в assets
-                alt = ASSETS_DIR / "realesrgan-models"
-                models = alt if alt.is_dir() else models
-            if exe.exists():
-                try:
-                    os.chmod(exe, 0o755)
-                except Exception:
-                    pass
-                return str(exe), (str(models) if models.is_dir() else None)
-    # системный
-    w = _which("realesrgan-ncnn-vulkan")
-    if w:
-        return w, None
-    return None, None
-
-
-RES_EXE, RES_MODELS = find_realesrgan()
-
-
-# ----------------------------------------------------------------------------- #
-#  Сетевые хелперы
-# ----------------------------------------------------------------------------- #
-def download(url: str, dest: Path, desc: str = "") -> bool:
-    """Скачивание файла: PowerShell (Windows) -> curl -> urllib."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(dest.suffix + ".part")
-    label = desc or dest.name
-    print(f"  {cl('↓', 'blue')} Скачиваю: {label}")
-    print(f"    {cl(url, 'dim')}")
-    cmds = []
-    if IS_WIN:
-        ps = (
-            "$ProgressPreference='SilentlyContinue';"
-            "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;"
-            f"Invoke-WebRequest -Uri '{url}' -OutFile '{tmp}' -UseBasicParsing"
-        )
-        cmds.append(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps])
-    cmds.append(["curl", "-L", "--fail", "--retry", "2", "-o", str(tmp), url])
-
-    for c in cmds:
-        try:
-            r = subprocess.run(c, capture_output=True, text=True, timeout=1800)
-            if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 1000:
-                tmp.replace(dest)
-                ok(f"Готово: {dest.name}  ({dest.stat().st_size/1e6:.1f} МБ)")
-                return True
-        except FileNotFoundError:
-            continue
+            p.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            warn("Таймаут скачивания")
-        except Exception as e:
-            warn(f"Ошибка: {e}")
-        finally:
-            if tmp.exists():
-                try:
-                    tmp.unlink()
-                except Exception:
-                    pass
-    # последний вариант — чистый python
-    try:
-        import urllib.request
-        urllib.request.urlretrieve(url, tmp)
-        if tmp.exists() and tmp.stat().st_size > 1000:
-            tmp.replace(dest)
-            ok(f"Готово: {dest.name}")
-            return True
-    except Exception as e:
-        err(f"Не удалось скачать {url}\n    {e}")
-    return False
-
-
-FFMPEG_URLS_WIN = [
-    "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
-    "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip",
-]
-
-
-def install_ffmpeg() -> bool:
-    print()
-    title("Установка FFmpeg")
-    if not IS_WIN:
-        warn("Авто-установка доступна только в Windows.")
-        info("Linux:  sudo apt install ffmpeg     macOS:  brew install ffmpeg")
-        return False
-    zip_path = TOOLS_DIR / "ffmpeg.zip"
-    got = False
-    for u in FFMPEG_URLS_WIN:
-        if download(u, zip_path, "FFmpeg (сборка для Windows)"):
-            got = True
-            break
-    if not got:
-        err("Скачать не получилось. Скачай вручную: https://www.gyan.dev/ffmpeg/builds/")
-        return False
-    try:
-        ok("Распаковываю...")
-        with zipfile.ZipFile(zip_path) as z:
-            z.extractall(TOOLS_DIR / "_ff")
-        found = 0
-        for name in ("ffmpeg.exe", "ffprobe.exe"):
-            for f in (TOOLS_DIR / "_ff").rglob(name):
-                shutil.copy2(f, TOOLS_DIR / name)
-                found += 1
-                break
-        shutil.rmtree(TOOLS_DIR / "_ff", ignore_errors=True)
-        zip_path.unlink(missing_ok=True)
-        if found == 2:
-            ok(f"FFmpeg установлен в {TOOLS_DIR}")
-            return True
-        err("В архиве не нашлись ffmpeg.exe / ffprobe.exe")
-    except Exception as e:
-        err(f"Ошибка распаковки: {e}")
-    return False
-
-
-def install_realesrgan() -> bool:
-    print()
-    title("Установка AI-движка Real-ESRGAN")
-    APPS_DIR.mkdir(parents=True, exist_ok=True)
-    zip_path = APPS_DIR / RES_WIN_ZIP
-    got = False
-    # 1) офлайн-вариант: архив уже лежит в assets/ (рядом с программой)
-    names = [RES_WIN_ZIP] if IS_WIN else [
-        "realesrgan-ncnn-vulkan-20220424-ubuntu.zip",
-        "realesrgan-ncnn-vulkan-20220424-macos.zip", RES_WIN_ZIP]
-    for nm in names:
-        bundled = ASSETS_DIR / nm
-        if bundled.is_file() and bundled.stat().st_size > 1_000_000:
-            ok(f"Найден локальный архив: {bundled.name} — интернет не нужен.")
-            shutil.copy2(bundled, zip_path)
-            got = True
-            break
-    # 2) скачивание
-    if not got:
-        for u in RES_URLS:
-            if download(u, zip_path, "Real-ESRGAN + модели (~45 МБ, один раз)"):
-                got = True
-                break
-    if not got:
-        err("Не удалось ни найти локальный архив, ни скачать.")
-        info(f"Скачай вручную и положи в {ASSETS_DIR}:")
-        info("https://github.com/xinntao/Real-ESRGAN/releases/tag/v0.2.5.0")
-        return False
-    try:
-        ok("Распаковываю...")
-        with zipfile.ZipFile(zip_path) as z:
-            z.extractall(APPS_DIR / "realesrgan")
-        zip_path.unlink(missing_ok=True)
-        if not IS_WIN:
-            for f in (APPS_DIR / "realesrgan").rglob("realesrgan-ncnn-vulkan*"):
-                try:
-                    os.chmod(f, 0o755)
-                except Exception:
-                    pass
-        global RES_EXE, RES_MODELS
-        RES_EXE, RES_MODELS = find_realesrgan()
-        if RES_EXE:
-            ok(f"AI-движок установлен: {RES_EXE}")
-            return True
-    except Exception as e:
-        err(f"Ошибка распаковки: {e}")
-    return False
-
-
-# ----------------------------------------------------------------------------- #
-#  Анализ видео
-# ----------------------------------------------------------------------------- #
-def probe(path: Path) -> Optional[dict]:
-    if not FFPROBE:
-        return None
-    cmd = [FFPROBE, "-v", "error", "-print_format", "json",
-           "-show_format", "-show_streams", str(path)]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=120)
-        return json.loads(r.stdout)
-    except Exception:
-        return None
-
-
-def parse_fps(raw: str) -> float:
-    if not raw:
-        return 0.0
-    try:
-        if "/" in raw:
-            a, b = raw.split("/")
-            return round(float(a) / float(b), 3) if float(b) else 0.0
-        return float(raw)
-    except Exception:
-        return 0.0
-
-
-class MediaInfo:
-    def __init__(self, path: Path):
-        self.path = path
-        self.width = self.height = 0
-        self.fps = 0.0
-        self.duration = 0.0
-        self.vcodec = "?"
-        self.pix_fmt = "?"
-        self.color_space = ""
-        self.bit_depth = 8
-        self.has_audio = False
-        self.acodec = ""
-        self.size = path.stat().st_size if path.exists() else 0
-        d = probe(path)
-        if not d:
-            return
-        fmt = d.get("format", {}) or {}
-        try:
-            self.duration = float(fmt.get("duration", 0) or 0)
-        except Exception:
-            self.duration = 0.0
-        for s in d.get("streams", []):
-            if s.get("codec_type") == "video" and self.width == 0:
-                self.width = int(s.get("width") or 0)
-                self.height = int(s.get("height") or 0)
-                self.fps = parse_fps(s.get("r_frame_rate") or s.get("avg_frame_rate") or "")
-                self.vcodec = s.get("codec_name", "?")
-                self.pix_fmt = s.get("pix_fmt", "?") or "?"
-                self.color_space = s.get("color_space", "") or ""
-                pf = self.pix_fmt
-                m = re.search(r"(\d+)le|(\d+)be", pf)
-                self.bit_depth = int(next((g for g in (m.groups() if m else []) if g), 8)) if m else 8
-                if "10" in pf or "12" in pf:
-                    self.bit_depth = 10 if "10" in pf else 12
-                try:
-                    self.duration = self.duration or float(s.get("duration", 0) or 0)
-                except Exception:
-                    pass
-            elif s.get("codec_type") == "audio" and not self.has_audio:
-                self.has_audio = True
-                self.acodec = s.get("codec_name", "")
-
-    @property
-    def valid(self) -> bool:
-        return self.width > 0 and self.height > 0
-
-    @property
-    def frames(self) -> int:
-        return max(1, int(self.duration * (self.fps or 25)))
-
-    def show(self) -> None:
-        print()
-        hr()
-        print(f"  {cl('Файл:', 'bold')}       {self.path.name}")
-        print(f"  {cl('Папка:', 'bold')}      {cl(str(self.path.parent), 'dim')}")
-        res = f"{self.width}×{self.height}"
-        label = "SD" if self.height < 720 else ("HD" if self.height < 1080 else
-                ("Full HD" if self.height < 1440 else ("2K" if self.height < 2160 else "4K+")))
-        print(f"  {cl('Разрешение:', 'bold')} {cl(res, 'magenta')} ({label})")
-        print(f"  {cl('Длительность:', 'bold')} {fmt_time(self.duration)}   "
-              f"{cl('FPS:', 'bold')} {self.fps or '?'}   "
-              f"{cl('Размер:', 'bold')} {human(self.size)}")
-        print(f"  {cl('Кодек:', 'bold')}      {self.vcodec} / {self.pix_fmt} "
-              f"({self.bit_depth} бит)   {cl('Звук:', 'bold')} "
-              f"{self.acodec if self.has_audio else cl('нет', 'yellow')}")
-        hr()
-
-
-def total_ram_gb() -> float:
-    """Объём ОЗУ в ГБ (Windows / Linux / macOS)."""
-    try:
-        if IS_WIN:
-            import ctypes
-
-            class MEMORYSTATUSEX(ctypes.Structure):
-                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
-                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
-                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
-                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-
-            st = MEMORYSTATUSEX()
-            st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))  # type: ignore[attr-defined]
-            return st.ullTotalPhys / (1024 ** 3)
-        for p in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
-            if os.path.exists(p):
-                v = Path(p).read_text().strip()
-                if v.isdigit() and int(v) < (1 << 50):
-                    return int(v) / (1024 ** 3)
-        if os.path.exists("/proc/meminfo"):
-            for line in Path("/proc/meminfo").read_text().splitlines():
-                if line.startswith("MemTotal:"):
-                    return float(line.split()[1]) / (1024 ** 2)
-    except Exception:
-        pass
-    return 8.0
-
-
-def free_disk_gb(path: Path) -> float:
-    try:
-        return shutil.disk_usage(str(path.parent if path.is_file() else path)).free / (1024 ** 3)
-    except Exception:
-        return 999.0
-
-
-def human(n: float) -> str:
-    for u in ("Б", "КБ", "МБ", "ГБ"):
-        if n < 1024:
-            return f"{n:.1f} {u}" if u != "Б" else f"{int(n)} {u}"
-        n /= 1024
-    return f"{n:.1f} ТБ"
-
-
-def fmt_time(s: float) -> str:
-    if not s or s < 0:
-        return "00:00"
-    s = int(s)
-    h, m, sec = s // 3600, (s % 3600) // 60, s % 60
-    return f"{h:d}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
-
-
-# ----------------------------------------------------------------------------- #
-#  Ввод/вывод в консоли
-# ----------------------------------------------------------------------------- #
-def clean_path(s: str) -> Path:
-    """Убирает кавычки и хвостовые точки/пробелы (Windows drag&drop)."""
-    s = s.strip().strip('"').strip("'").strip()
-    while s.endswith("."):
-        s = s[:-1]
-    return Path(s).expanduser()
-
-
-def ask(prompt: str, default: str = "") -> str:
-    d = f" {cl('[' + default + ']', 'dim')}" if default else ""
-    try:
-        v = input(f"  {cl(prompt, 'bold')}{d} > ").strip()
-    except EOFError:
-        return default
-    return v or default
-
-
-def ask_choice(prompt: str, options: List[Tuple[str, str]], default: str = "1",
-               note: Optional[str] = None) -> str:
-    print()
-    print(f"  {cl(prompt, 'bold', 'cyan')}")
-    for key, label in options:
-        mark = cl("►", "green") if key == default else " "
-        print(f"   {mark} {cl('[' + key + ']', 'yellow')} {label}")
-    if note:
-        print(f"     {cl(note, 'dim')}")
-    while True:
-        v = ask("Выбор", default).lower()
-        keys = [k for k, _ in options]
-        if v in keys:
-            return v
-        err(f"Введи одну из: {', '.join(keys)}")
-
-
-def ask_yes(prompt: str, default: bool = False) -> bool:
-    d = "Y/n" if default else "y/N"
-    while True:
-        v = ask(f"{prompt} ({d})", "").lower()
-        if not v:
-            return default
-        if v in ("y", "yes", "д", "да", "1", "+"):
-            return True
-        if v in ("n", "no", "н", "нет", "0", "-"):
-            return False
-        err("Ответь y (да) или n (нет)")
-
-
-def pick_file() -> Optional[Path]:
-    print()
-    print(cl("  Перетащи видеофайл (или папку с видео) прямо в это окно и нажми Enter.", "dim"))
-    print(cl("  Либо введи полный путь. Пустая строка — выход.", "dim"))
-    while True:
-        raw = ask("Файл / папка", "")
-        if not raw:
-            return None
-        p = clean_path(raw)
-        if p.is_file():
-            return p
-        if p.is_dir():
-            vids = sorted([f for f in p.iterdir()
-                           if f.is_file() and f.suffix.lower() in VIDEO_EXTS])
-            if not vids:
-                err(f"В папке {p} видео не найдено.")
-                continue
-            if len(vids) == 1:
-                return vids[0]
-            print()
-            print(f"  {cl('В папке найдено видео:', 'bold')}")
-            opts = []
-            for i, f in enumerate(vids, 1):
-                mi = MediaInfo(f)
-                opts.append((str(i), f"{f.name}  {cl(f'{mi.width}×{mi.height}', 'magenta')}"))
-                if i >= 9:
-                    break
-            opts.append(("a", cl("Обработать ВСЕ файлы папки (пакетно)", "green")))
-            c = ask_choice("Что обработать?", opts, "1")
-            if c == "a":
-                return p          # вернём папку — режим batch
-            return vids[int(c) - 1]
-        err(f"Не найдено: {p}")
-
-
-def ask_settings() -> dict:
-    """Один раз спрашивает настройки — применяются ко всем файлам пакета."""
-    auto: dict = {"yes": True}
-    c = ask_choice("Движок для всех файлов?", [
-        ("1", "БЫСТРЫЙ (ffmpeg) — быстро, всегда работает"),
-        ("2", "AI (Real-ESRGAN) — лучшее качество, нужна видеокарта")], "1")
-    auto["engine"] = "fast" if c == "1" else "ai"
-    c = ask_choice("Целевое разрешение?", [
-        ("720", "1280×720 HD"), ("1080", "1920×1080 Full HD"),
-        ("1440", "2560×1440 2K"), ("4k", "3840×2160 4K"),
-        ("x2", "в 2 раза от исходника")], "4k")
-    if c == "x2":
-        auto["fit_x2"] = True
-    else:
-        auto["size"] = TARGETS[c][0], TARGETS[c][1]
-    if auto["engine"] == "fast":
-        c = ask_choice("Пресет?", [(k, v["name"]) for k, v in PRESETS.items()], "balanced")
-        auto["preset"] = c
-    else:
-        c = ask_choice("Модель нейросети?", [(k, v["name"]) for k, v in AI_MODELS.items()], "general")
-        auto["model"] = c
-    return auto
-
-
-# ----------------------------------------------------------------------------- #
-#  Прогресс ffmpeg
-# ----------------------------------------------------------------------------- #
-class Progress:
-    """Парсит stderr ffmpeg (frame=/time=) и рисует полоску прогресса."""
-
-    def __init__(self, total_sec: float, label: str = "Обработка"):
-        self.total = max(total_sec, 0.001)
-        self.label = label
-        self._stop = False
-        self._cur = 0.0
-        self._frame = 0
-        self._fps = 0.0
-        self._t0 = time.time()
-
-    def start(self) -> None:
-        self._t0 = time.time()
-        th = threading.Thread(target=self._loop, daemon=True)
-        th.start()
-
-    def feed(self, chunk: str) -> None:
-        for m in re.finditer(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", chunk):
-            h, mi, s = m.groups()
-            self._cur = int(h) * 3600 + int(mi) * 60 + float(s)
-        for m in re.finditer(r"frame=\s*(\d+)\s+fps=\s*([\d.]+)", chunk):
-            self._frame = int(m.group(1))
-            try:
-                self._fps = float(m.group(2))
-            except Exception:
-                pass
-
-    def _loop(self) -> None:
-        last = -1
-        while not self._stop:
-            p = min(self._cur / self.total, 1.0)
-            if int(p * 100) != last:
-                last = int(p * 100)
-                self._draw(p)
-            time.sleep(0.2)
-
-    def _draw(self, p: float) -> None:
-        width = 28
-        filled = int(width * p)
-        bar = "█" * filled + "░" * (width - filled)
-        el = time.time() - self._t0
-        eta = (el / p - el) if p > 0.02 else 0
-        spd = ""
-        if self._fps:
-            spd = f" {self._fps:.0f} fps"
-        line = (f"\r  {self.label} {cl(bar, 'green')} {p*100:5.1f}%  "
-                f"{fmt_time(self._cur)}/{fmt_time(self.total)}{spd}  "
-                f"осталось ~{fmt_time(eta)}   ")
-        sys.stdout.write(line[:118].ljust(118))
-        sys.stdout.flush()
-
-    def done(self) -> None:
-        self._stop = True
-        self._draw(1.0)
-        sys.stdout.write("\n")
-        sys.stdout.flush()
-
-
-def run_ffmpeg(cmd: List[str], total_sec: float, label: str = "Обработка",
-               quiet_tail: bool = False) -> int:
-    """Запуск ffmpeg с живым прогрессом. Возвращает код возврата."""
-    pr = Progress(total_sec, label)
-    pr.start()
-    try:
-        p = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace", bufsize=1,
-            creationflags=(subprocess.CREATE_NO_WINDOW if IS_WIN else 0),
-        )
-        buf = ""
-        assert p.stderr is not None
-        while True:
-            ch = p.stderr.read(1)
-            if not ch:
-                break
-            buf += ch
-            if ch in ("\r", "\n"):
-                pr.feed(buf)
-                if not quiet_tail:
-                    buf = ""
-                else:
-                    buf = buf[-2000:]
-        p.wait()
-        pr.done()
-        return p.returncode
-    except KeyboardInterrupt:
-        pr.done()
-        raise
-    except Exception as e:
-        pr.done()
-        err(str(e))
-        return 1
-
-
-# ----------------------------------------------------------------------------- #
-#  Формирование цепочки фильтров (БЫСТРЫЙ движок)
-# ----------------------------------------------------------------------------- #
-_FILTER_CACHE: Dict[str, bool] = {}
-
-
-def filter_supported(chain: str) -> bool:
-    """Проверяет, поддерживает ли установленный ffmpeg цепочку фильтров."""
-    if chain in _FILTER_CACHE:
-        return _FILTER_CACHE[chain]
-    if not FFMPEG:
-        return False
-    try:
-        r = subprocess.run(
-            [FFMPEG, "-hide_banner", "-loglevel", "error", "-f", "lavfi",
-             "-i", "nullsrc=size=64x64:duration=0.04:rate=25",
-             "-vf", chain, "-f", "null", "-"],
-            capture_output=True, text=True, timeout=120,
-            creationflags=(subprocess.CREATE_NO_WINDOW if IS_WIN else 0))
-        _FILTER_CACHE[chain] = (r.returncode == 0)
-    except Exception:
-        _FILTER_CACHE[chain] = False
-    return _FILTER_CACHE[chain]
-
-
-def target_size(src: MediaInfo, tw: int, th: int,
-                mode: str = "fit") -> Tuple[int, int]:
-    """Считает итоговый размер с сохранением пропорций (чётные числа)."""
-    sw, sh = src.width or 16, src.height or 9
-    if mode == "stretch":
-        w, h = tw, th
-    elif mode == "fill":
-        r = max(tw / sw, th / sh)
-        w, h = sw * r, sh * r
-    else:  # fit
-        r = min(tw / sw, th / sh)
-        w, h = sw * r, sh * r
-    w = int(round(w / 2) * 2)
-    h = int(round(h / 2) * 2)
-    return max(2, w), max(2, h)
-
-
-def build_filterchain(src: MediaInfo, w: int, h: int, preset: dict,
-                      fps_out: float, upscale: bool) -> str:
-    f: List[str] = []
-
-    # 1) Деинтерлейсинг для чересстрочного источника
-    if preset.get("deint"):
-        f.append("yadif=mode=0:parity=-1:deint=interlaced")
-
-    # 2) Устранение «грязи» ПЕРЕД апскейлом (шум + блоки сжатия)
-    if preset.get("deblock") and filter_supported("deblock=filter=weak"):
-        f.append("deblock=filter=weak:block=3:alpha=0.10:beta=0.05")
-    if preset.get("denoise", 0):
-        d = preset["denoise"]
-        f.append(f"hqdn3d={1.0*d:.2f}:{0.8*d:.2f}:{4.0*d:.2f}:{3.0*d:.2f}")
-
-    # 3) Апскейл (или даунскейл) с сохранением пропорций + корректная матрица цвета
-    if upscale:
-        f.append(f"scale={w}:{h}:flags=spline+accurate_rnd+full_chroma_int+full_chroma_inp"
-                 f":in_color_matrix=auto:out_color_matrix=bt709")
-    else:
-        f.append(f"scale={w}:{h}:flags=lanczos+accurate_rnd+full_chroma_int"
-                 f":in_color_matrix=auto:out_color_matrix=bt709")
-
-    # 4) SD (PAL/NTSC) → HD: доп. конвертация матрицы, если ffmpeg её понимает
-    if (src.height or 0) <= 576:
-        for cm in ("colormatrix=bt601-6-625:bt709", "colormatrix=bt470bg:bt709"):
-            if filter_supported(cm):
-                f.append(cm)
-                break
-
-    # 5) Резкость: unsharp (локальный контраст) + cas (детализация)
-    lx, ly, la = preset.get("unsharp", (0, 0, 0.0))
-    if la:
-        f.append(f"unsharp=luma_msize_x={lx}:luma_msize_y={ly}:luma_amount={la:.2f}"
-                 f":chroma_msize_x=3:chroma_msize_y=3:chroma_amount=0.15")
-    if preset.get("sharpen", 0) and filter_supported("cas=0.5"):
-        f.append(f"cas={min(1.0, preset['sharpen']):.2f}")
-
-    # 6) Цвет / контраст
-    eq = []
-    if preset.get("sat", 1.0) != 1.0:
-        eq.append(f"saturation={preset['sat']:.2f}")
-    if preset.get("cont", 1.0) != 1.0:
-        eq.append(f"contrast={preset['cont']:.2f}")
-    if preset.get("gamma", 1.0) != 1.0:
-        eq.append(f"gamma={preset['gamma']:.2f}")
-    if eq:
-        f.append("eq=" + ":".join(eq))
-
-    # 7) Лёгкое «киношное» зерно — маскирует артефакты апскейла
-    if preset.get("grain", 0):
-        f.append(f"gblur=sigma={0.35 + 0.25*preset['grain']:.2f}:steps=1")
-        f.append(f"noise=alls={int(3 + 6*preset['grain'])}:allf=t+u")
-
-    # 8) Повышение частоты кадров
-    if fps_out and fps_out > (src.fps or 0) + 0.5:
-        mi = (f"minterpolate=fps={fps_out:g}:mi_mode=mci:mc_mode=aobmc:"
-              f"me_mode=bidir:vsbmc=1:scd=fdiff:scd_threshold=8")
-        if filter_supported(f"minterpolate=fps={fps_out:g}"):
-            f.append(mi)
-        else:
-            f.append(f"fps={fps_out:g}")
-            warn("minterpolate недоступен — использую простое fps (без дорисовки движения)")
-
-    f.append("format=yuv420p")
-    return ",".join(f)
-
-
-def x264_mem_guard(w: int, h: int, ref: int, lookahead: int,
-                   threads: int) -> Tuple[int, int]:
-    """Уменьшает ref/rc-lookahead, если x264 не влезет в ОЗУ.
-
-    x264 при 4K с дефолтным lookahead=40 и ref=3 может потребовать 1.5-2 ГБ
-    и на слабых машинах молча падает. Считаем грубо и подрезаем параметры.
-    """
-    ram = total_ram_gb()
-    mb_frame = w * h * 1.5 * 3 / (1024 ** 2)      # ~24 МБ на кадр для 4K
-    est = mb_frame * (ref + lookahead + 6 + threads * 2.0) / 1024
-    budget = max(ram * 0.55, 0.35)
-    while est > budget and lookahead > 8:
-        lookahead = max(8, int(lookahead * 0.6))
-        est = mb_frame * (ref + lookahead + 6 + threads * 2.0) / 1024
-    while est > budget and ref > 1:
-        ref -= 1
-        est = mb_frame * (ref + lookahead + 6 + threads * 2.0) / 1024
-    return ref, lookahead
-
-
-def encode_args(preset: dict, w: int = 1920, h: int = 1080,
-                extra_slow: bool = False) -> List[str]:
-    """Аргументы кодека: качество + защита от нехватки памяти."""
-    crf = preset.get("crf", 17)
-    x264_preset = "slow" if (preset.get("slow") or extra_slow) else "medium"
-    ref = 5 if x264_preset == "slow" else 3
-    lookahead = 40
-    if w * h > 1920 * 1080:
-        ref, lookahead = x264_mem_guard(w, h, ref, lookahead, max(1, (os.cpu_count() or 2)))
-        if ref < 5 and x264_preset == "slow":
-            x264_preset = "medium"          # slow на 4K ест слишком много ОЗУ/времени
-    args = ["-c:v", "libx264", "-preset", x264_preset, "-crf", str(crf),
-            "-profile:v", "high",
-            "-x264-params", f"ref={ref}:rc-lookahead={lookahead}",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
-    if w * h >= 3840 * 2160:
-        args[args.index("-profile:v") + 1] = "high"
-        args += ["-level", "5.1"]
-    return args
-
-
-# ----------------------------------------------------------------------------- #
-#  ДВИЖОК 1: БЫСТРЫЙ (ffmpeg)
-# ----------------------------------------------------------------------------- #
-def run_fast_engine(src: MediaInfo, out: Path, w: int, h: int, preset: dict,
-                    fps_out: float, threads: int = 0) -> bool:
-    upscale = w >= (src.width or 0)
-    chain = build_filterchain(src, w, h, preset, fps_out, upscale)
-
-    ram = total_ram_gb()
-    if w * h >= 3840 * 2160 and ram < 6:
-        warn(f"ОЗУ всего {ram:.1f} ГБ — для {w}×{h} кодеку придётся урезать "
-             f"буферы, качество чуть снизится, но работать будет.")
-
-    def build_cmd(pres: dict) -> List[str]:
-        cmd = [FFMPEG, "-hide_banner", "-y", "-threads", str(threads or 0),
-               "-i", str(src.path), "-vf", chain,
-               "-r", f"{fps_out:g}" if fps_out else f"{src.fps or 25:g}"]
-        cmd += encode_args(pres, w, h)
-        if src.has_audio:
-            cmd += ["-map", "0:v:0", "-map", "0:a", "-c:a", "aac", "-b:a", "192k",
-                    "-ar", "48000", "-ac", "2"]
-        else:
-            cmd += ["-an"]
-        cmd += ["-shortest", str(out)]
-        return cmd
-
-    print()
-    print(f"  {cl('Цепочка фильтров:', 'dim')}")
-    for part in chain.split(","):
-        print(f"     {cl('•', 'blue')} {part}")
-    print()
-
-    rc = run_ffmpeg(build_cmd(preset), src.duration, "Быстрый апскейл")
-    if rc == 0 and out.exists() and out.stat().st_size > 1000:
-        return True
-
-    # ---- запасной вариант: меньше нагрузка на память/процессор ---- #
-    warn("Первый проход не удался — пробую облегчённый режим кодирования...")
-    out.unlink(missing_ok=True)
-    light = dict(preset)
-    light["slow"] = False
-    light["crf"] = max(preset.get("crf", 17), 19)
-    cmd = build_cmd(light)
-    # принудительно режем lookahead и ref до минимума
-    if "-x264-params" in cmd:
-        cmd[cmd.index("-x264-params") + 1] = "ref=1:rc-lookahead=8"
-    if "-preset" in cmd:
-        cmd[cmd.index("-preset") + 1] = "faster"
-    rc = run_ffmpeg(cmd, src.duration, "Быстрый апскейл (лёгкий)")
-    if rc == 0 and out.exists() and out.stat().st_size > 1000:
-        return True
-    err(f"ffmpeg завершился с кодом {rc}.")
-    info("Что попробовать: пресет «Мягкий», разрешение 1080p/1440p вместо 4K, "
-         "или движок AI.")
-    return False
-
-
-# ----------------------------------------------------------------------------- #
-#  ДВИЖОК 2: AI (Real-ESRGAN ncnn-vulkan)
-# ----------------------------------------------------------------------------- #
-def gpu_is_available() -> Tuple[bool, str]:
-    """Быстрая проверка: есть ли Vulkan-устройство (и не программный ли рендер)."""
-    if not RES_EXE:
-        return False, "AI-движок не установлен"
-    try:
-        import tempfile
-        with tempfile.TemporaryDirectory() as td:
-            inp = Path(td) / "t.png"
-            try:
-                import cv2
-                import numpy as np
-                cv2.imwrite(str(inp), np.zeros((32, 32, 3), dtype=np.uint8))
-            except Exception:
-                inp.write_bytes(bytes.fromhex(
-                    "89504e470d0a1a0a0000000d49484452000000010000000108060000"
-                    "001f15c4890000000a49444154789c63000100000500010d0a2db4"
-                    "0000000049454e44ae426082"))
-            outp = Path(td) / "o.png"
-            args = [RES_EXE, "-i", str(inp), "-o", str(outp), "-s", "2"]
-            if RES_MODELS:
-                args += ["-m", RES_MODELS]
-            r = subprocess.run(args, capture_output=True, text=True,
-                               encoding="utf-8", errors="replace", timeout=300,
-                               creationflags=(subprocess.CREATE_NO_WINDOW if IS_WIN else 0))
-            txt = (r.stdout or "") + (r.stderr or "")
-            m = re.search(r"\[\d+\s+([^\]]+)\]", txt)
-            dev = m.group(1).strip() if m else "неизвестно"
-            if r.returncode != 0:
-                return False, f"Vulkan недоступен (устройство: {dev})"
-            soft = any(k in dev.lower()
-                       for k in ("llvmpipe", "softpipe", "software", "basic render", "swrast"))
-            return (not soft), dev
-    except Exception as e:
-        return False, f"ошибка проверки: {e}"
-
-
-def pick_ai_scale(src: MediaInfo, w: int, h: int, model_key: str) -> int:
-    """Минимальный масштаб нейросети, покрывающий целевое разрешение."""
-    scales = AI_MODELS[model_key]["scales"]
-    need = max(w / max(src.width, 1), h / max(src.height, 1))
-    for s in scales:
-        if s >= need - 0.01:
-            return s
-    return scales[-1]
-
-
-def ai_chunk_frames(w: int, h: int) -> int:
-    """Сколько кадров держать на диске одновременно, чтобы его не забить."""
-    mb_in = max((w * 3) * (h * 3) * 3 / (1024 ** 2) * 0.55, 0.3)   # PNG после апскейла
-    mb_pair = mb_in + max(w * h * 3 / (1024 ** 2) * 0.6, 0.1)
-    free = free_disk_gb(TEMP_ROOT if TEMP_ROOT.exists() else BASE_DIR) * 1024
-    budget = max(free * 0.4, 300)          # МБ, не больше 40% свободного места
-    n = int(budget / max(mb_pair, 0.5))
-    return max(24, min(n, 300))
-
-
-def run_ai_engine(src: MediaInfo, out: Path, w: int, h: int,
-                  model_key: str = "general", crf: int = 17,
-                  threads: str = "1:2:2", preview_sec: float = 0) -> bool:
-    """Покадровый AI-апскейл чанками: извлекли → улучшили → собрали."""
-    global RES_EXE, RES_MODELS
-    if not RES_EXE or not RES_MODELS:
-        err("AI-движок Real-ESRGAN не найден.")
-        if IS_WIN and ask_yes("Скачать и установить сейчас? (~45 МБ, один раз)", True):
-            if not install_realesrgan():
-                return False
-        if not RES_EXE or not RES_MODELS:
-            return False
-
-    scale = pick_ai_scale(src, w, h, model_key)
-    model = AI_MODELS[model_key]["model"]
-    fps = src.fps or 25.0
-    dur = preview_sec or src.duration
-    total_frames = max(1, int(dur * fps))
-
-    print()
-    info(f"Модель: {cl(model, 'magenta')}   Масштаб нейросети: {cl('x' + str(scale), 'magenta')}"
-         f"   → {src.width*scale}×{src.height*scale}, затем точно до {w}×{h}")
-
-    work = TEMP_ROOT / f"ai_{int(time.time())}_{os.getpid()}"
-    work.mkdir(parents=True, exist_ok=True)
-    ups_root = work / "upscaled"
-    ups_root.mkdir(exist_ok=True)
-
-    chunk = ai_chunk_frames(src.width, src.height)
-    info(f"Обработка порциями по {cl(str(chunk), 'cyan')} кадров "
-         f"(всего ~{total_frames}) — диск не переполнится.")
-
-    done_frames = 0
-    t_start = time.time()
-    try:
-        while done_frames < total_frames:
-            n = min(chunk, total_frames - done_frames)
-            f_in = work / "in"
-            f_out = work / "out"
-            shutil.rmtree(f_in, ignore_errors=True)
-            shutil.rmtree(f_out, ignore_errors=True)
-            f_in.mkdir(parents=True, exist_ok=True)
-            f_out.mkdir(parents=True, exist_ok=True)
-
-            start_frame = done_frames + 1
-            end_frame = done_frames + n
-            print()
-            print(cl(f"  Порция {start_frame}–{end_frame} из ~{total_frames}", "bold", "blue"))
-
-            # --- извлечение кадров (глобальная нумерация) ---
-            ss = done_frames / fps
-            cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
-                   "-ss", f"{ss:.4f}", "-i", str(src.path),
-                   "-frames:v", str(n), "-map", "0:v:0", "-fps_mode", "passthrough",
-                   "-pix_fmt", "rgb24", "-compression_level", "3",
-                   "-start_number", str(start_frame),
-                   str(f_in / "f_%08d.png")]
-            rc = run_ffmpeg(cmd, n / fps, "    извлечение")
-            got = sorted(f_in.glob("f_*.png"))
-            if not got:
-                warn("Кадры закончились раньше времени.")
-                break
-
-            # --- нейросеть ---
-            args = [RES_EXE, "-i", str(f_in), "-o", str(f_out),
-                    "-n", model, "-s", str(scale), "-m", RES_MODELS,
-                    "-j", threads, "-f", "png"]
-            t0 = time.time()
-            p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 text=True, encoding="utf-8", errors="replace",
-                                 creationflags=(subprocess.CREATE_NO_WINDOW if IS_WIN else 0))
-            shown = -1
-            buf = ""
-            assert p.stdout is not None
-            while True:
-                ch = p.stdout.read(1)
-                if not ch:
-                    break
-                buf += ch
-                if ch == "\n":
-                    m = re.search(r"([\d.]+)%", buf)
-                    if m:
-                        pct = float(m.group(1))
-                        if int(pct) != shown:
-                            shown = int(pct)
-                            width = 26
-                            filled = int(width * pct / 100)
-                            bar = "█" * filled + "░" * (width - filled)
-                            overall = (done_frames + len(got) * pct / 100) / total_frames
-                            el = time.time() - t_start
-                            eta = (el / max(overall, 0.01)) * (1 - overall)
-                            sys.stdout.write(
-                                (f"\r    AI {cl(bar, 'magenta')} {pct:5.1f}%  "
-                                 f"| всего {overall*100:4.1f}%  осталось ~{fmt_time(eta)}  ")[:116].ljust(116))
-                            sys.stdout.flush()
-                    buf = ""
+            with contextlib.suppress(OSError):
+                p.kill()
             p.wait()
-            sys.stdout.write("\n")
-            if p.returncode != 0:
-                err(f"Real-ESRGAN вернул код {p.returncode}")
-                return False
-
-            ups = sorted(f_out.glob("*.png"))
-            if not ups:
-                err("Нейросеть не вернула кадры.")
-                return False
-            for f in ups:
-                shutil.move(str(f), str(ups_root / f.name))
-            info(f"Готово за {fmt_time(time.time()-t0)}: {len(ups)} кадр(ов)")
-
-            done_frames += len(got)
-            if len(got) < n:
-                break       # видео короче, чем ожидалось
-            shutil.rmtree(f_in, ignore_errors=True)
-            shutil.rmtree(f_out, ignore_errors=True)
-
-        all_frames = sorted(ups_root.glob("*.png"))
-        if not all_frames:
-            err("Нет улучшенных кадров.")
-            return False
-        ok(f"Улучшено всего кадров: {len(all_frames)}")
-
-        # --- сборка через concat demuxer ---
-        print()
-        print(cl("  Сборка видео + звук", "bold"))
-        list_file = work / "frames.txt"
-        frame_dur = 1.0 / fps
-        with open(list_file, "w", encoding="utf-8") as fh:
-            for f in all_frames:
-                fh.write(f"file '{f.as_posix()}'\n")
-                fh.write(f"duration {frame_dur:.8f}\n")
-
-        cmd = [FFMPEG, "-hide_banner", "-y",
-               "-f", "concat", "-safe", "0", "-i", str(list_file)]
-        if src.has_audio:
-            cmd += ["-i", str(src.path),
-                    "-map", "0:v:0", "-map", "1:a?",
-                    "-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
-        else:
-            cmd += ["-an"]
-        cmd += ["-fps_mode", "passthrough",
-                "-vf", f"scale={w}:{h}:flags=lanczos,format=yuv420p",
-                "-c:v", "libx264", "-preset", "medium", "-crf", str(crf),
-                "-x264-params", "ref=%d:rc-lookahead=%d" % x264_mem_guard(
-                    w, h, 3, 40, max(1, os.cpu_count() or 2)),
-                "-profile:v", "high", "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart", "-shortest", str(out)]
-
-        rc = run_ffmpeg(cmd, dur, "  Кодирование H.264")
-        if rc != 0:
-            err("Не удалось собрать итоговое видео.")
-            return False
-        return out.exists() and out.stat().st_size > 1000
-
-    except KeyboardInterrupt:
-        print()
-        warn("Прервано (Ctrl+C). Временные файлы удалены.")
-        return False
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
-        purge_temp()          # не оставляем НИЧЕГО во временной папке
 
 
-def make_comparison(src_path: Path, out_path: Path, when: float = -1.0) -> Optional[Path]:
-    """Делает кадр «ДО | ПОСЛЕ» — удобно сравнить качество глазами."""
+def terminate(signum, frame):
+    raise KeyboardInterrupt
+
+
+@contextlib.contextmanager
+def child(cmd, **kwargs):
+    p = subprocess.Popen([str(x) for x in cmd], **kwargs)
+    ACTIVE.add(p)
     try:
-        if not FFMPEG:
-            return None
-        s_info, o_info = MediaInfo(src_path), MediaInfo(out_path)
-        if not s_info.valid or not o_info.valid:
-            return None
-        base = min(d for d in (s_info.duration, o_info.duration) if d)
-        t = when if when >= 0 else max(base * 0.35, 0.04)
-        t = min(t, max(base - 0.05, 0.0))
-        h = min(max(s_info.height, 360), 1080)
-        if h % 2:
-            h += 1
-        dest = out_path.with_name(out_path.stem + "_сравнение.jpg")
-        font = ""
-        for fp in ("C:/Windows/Fonts/arial.ttf", "C:/Windows/Fonts/calibri.ttf",
-                   "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                   "/usr/share/fonts/TTF/DejaVuSans.ttf",
-                   "/System/Library/Fonts/Helvetica.ttc"):
-            if os.path.exists(fp):
-                font = ":fontfile=" + fp.replace(":", "\\:")
+        yield p
+    finally:
+        stop(p)
+        for stream in (p.stdin, p.stdout, p.stderr):
+            if stream:
+                with contextlib.suppress(OSError):
+                    stream.close()
+        ACTIVE.discard(p)
+
+
+def executable(name, env=None):
+    filename = name + ('.exe' if WIN else '')
+    if env and os.environ.get(env):
+        p = Path(os.environ[env]).expanduser()
+        if p.is_dir():
+            p = p / filename
+        if p.is_file():
+            return str(p.resolve())
+    for folder in (BASE / 'tools', BASE / 'apps', BASE / 'assets', BASE):
+        p = folder / filename
+        if p.is_file():
+            return str(p)
+    # Do not recursively scan the whole project, input videos or cache.
+    for folder in (BASE / 'tools', BASE / 'apps'):
+        if folder.is_dir():
+            found = next(folder.rglob(filename), None)
+            if found:
+                return str(found)
+    return shutil.which(name)
+
+
+def tools():
+    ff = executable('ffmpeg', 'FFMPEG_PATH')
+    probe = executable('ffprobe', 'FFPROBE_PATH')
+    if ff and not probe:
+        sibling = Path(ff).with_name('ffprobe.exe' if WIN else 'ffprobe')
+        if sibling.is_file():
+            probe = str(sibling)
+    if not ff or not probe:
+        raise RuntimeError('Нужны FFmpeg И FFprobe в PATH или tools/. Windows: --install-ffmpeg; '
+                           'Linux: sudo apt install ffmpeg; macOS: brew install ffmpeg')
+    return ff, probe
+
+
+def ai_tools():
+    exe = executable('realesrgan-ncnn-vulkan', 'RES_PATH')
+    candidates = [Path(os.environ['RES_MODELS']).expanduser()] if os.environ.get('RES_MODELS') else []
+    if exe:
+        candidates += [Path(exe).parent / 'models', BASE / 'assets' / 'realesrgan-models']
+    models = next((p.resolve() for p in candidates if p.is_dir()), None)
+    if not exe or not models:
+        raise RuntimeError('Не найден Real-ESRGAN или models/. Windows: --install-ai; '
+                           'другие ОС: распакуйте сборку в apps/. RES_PATH — бинарник или его папка, '
+                           'RES_MODELS — папка моделей.')
+    if not WIN:
+        Path(exe).chmod(Path(exe).stat().st_mode | 0o111)
+    return exe, str(models)
+
+
+def safe_extract(archive, dest):
+    dest = dest.resolve()
+    with zipfile.ZipFile(archive) as z:
+        for item in z.infolist():
+            p = (dest / item.filename).resolve()
+            if p != dest and dest not in p.parents:
+                raise RuntimeError('Небезопасный путь в ZIP')
+            if (item.external_attr >> 16) & 0o170000 == 0o120000:
+                raise RuntimeError('Символические ссылки в ZIP запрещены')
+        z.extractall(dest)
+
+
+def install(kind):
+    if not WIN:
+        raise RuntimeError('Автозагрузка только для Windows x64. Для Linux/macOS установите '
+                           'FFmpeg пакетным менеджером, Real-ESRGAN — сборку под вашу ОС.')
+    if kind == 'ffmpeg':
+        url = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
+        dest = BASE / 'tools'
+    else:
+        url = ('https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/'
+               'realesrgan-ncnn-vulkan-20220424-windows.zip')
+        dest = BASE / 'apps' / 'realesrgan'
+    dest.mkdir(parents=True, exist_ok=True)
+    say('Скачивание официального архива: ' + url)
+    with tempfile.TemporaryDirectory(prefix='install_', dir=dest) as tmp:
+        archive = Path(tmp) / 'download.zip'
+        with urllib.request.urlopen(url, timeout=60) as response, archive.open('wb') as f:
+            shutil.copyfileobj(response, f)
+        unpacked = Path(tmp) / 'unpacked'
+        safe_extract(archive, unpacked)
+        if kind == 'ffmpeg':
+            for name in ('ffmpeg.exe', 'ffprobe.exe'):
+                src = next(unpacked.rglob(name), None)
+                if not src:
+                    raise RuntimeError('В архиве не найден ' + name)
+                shutil.copy2(src, dest / name)
+        else:
+            src = next(unpacked.rglob('realesrgan-ncnn-vulkan.exe'), None)
+            if not src or not (src.parent / 'models').is_dir():
+                raise RuntimeError('Неполный архив Real-ESRGAN')
+            shutil.copytree(src.parent, dest, dirs_exist_ok=True)
+    say('Установлено: ' + str(dest))
+
+
+def number(raw, default=0.0):
+    try:
+        value = float(Fraction(str(raw)))
+        return value if math.isfinite(value) else default
+    except (ValueError, ZeroDivisionError, TypeError):
+        return default
+
+
+def inspect(path, ffprobe):
+    r = subprocess.run([ffprobe, '-v', 'error', '-show_streams', '-show_format',
+                        '-of', 'json', str(path)], capture_output=True, timeout=120,
+                       encoding='utf-8', errors='replace')
+    if r.returncode:
+        raise RuntimeError('FFprobe: ' + r.stderr[-3000:])
+    data = json.loads(r.stdout)
+    videos = [s for s in data.get('streams', []) if s.get('codec_type') == 'video'
+              and not s.get('disposition', {}).get('attached_pic')]
+    if not videos:
+        raise RuntimeError('Видеопоток не найден: ' + str(path))
+    v = videos[0]
+    w, h = int(v['width']), int(v['height'])
+    sar = number(v.get('sample_aspect_ratio', '1:1').replace(':', '/'), 1) or 1
+    # FFmpeg autorotates; normalize non-square pixels to square pixels too.
+    w = max(2, round(w * sar))
+    rotation = number(v.get('tags', {}).get('rotate', 0))
+    for side in v.get('side_data_list', []):
+        rotation = number(side.get('rotation', rotation))
+    if abs(round(rotation)) % 180 == 90:
+        w, h = h, w
+    rate = v.get('avg_frame_rate')
+    if number(rate) <= 0:
+        rate = v.get('r_frame_rate', '25/1')
+    if number(rate) <= 0:
+        rate = '25/1'
+    rate = str(Fraction(str(rate)).limit_denominator(1000000))
+    return dict(width=w, height=h, rate=rate, fps=number(rate), index=v['index'],
+                duration=number(v.get('duration')) or number(data.get('format', {}).get('duration')),
+                audio=any(s.get('codec_type') == 'audio' for s in data.get('streams', [])),
+                hdr=v.get('color_transfer') in ('smpte2084', 'arib-std-b67'),
+                interlaced=v.get('field_order') in ('tt', 'bb', 'tb', 'bt'),
+                stream=v)
+
+
+def dimensions(spec, media):
+    spec = spec.lower().strip()
+    sw, sh = media['width'], media['height']
+    if spec in TARGETS:
+        tw, th = TARGETS[spec]
+    elif re.fullmatch(r'x[234]|[234]x', spec):
+        factor = int(spec.replace('x', ''))
+        tw, th = sw * factor, sh * factor
+    else:
+        match = re.fullmatch(r'(\d+)\s*[xх*]\s*(\d+)', spec)
+        if not match:
+            raise ValueError('Неверный --target: ' + spec)
+        tw, th = map(int, match.groups())
+    if min(tw, th) < 2 or max(tw, th) > 16384:
+        raise ValueError('Размеры должны быть от 2 до 16384')
+    factor = min(tw / sw, th / sh)
+    # Floor, not round: never exceed the target bounding box.
+    return max(2, int(sw * factor) // 2 * 2), max(2, int(sh * factor) // 2 * 2)
+
+
+def ai_scale(media, w, h, key):
+    scales = MODELS[key][1]
+    need = max(w / media['width'], h / media['height'])
+    return next((s for s in scales if s >= need - 1e-6), scales[-1])
+
+
+def cache_plan(width, height, scale, budget_mib, available, reserve, requested=0):
+    # RGB/RGBA PNG's deflate worst case is slightly larger than raw data.
+    # Include alpha, row filters, PNG chunks and conservative 15% overhead.
+    pair = math.ceil(width * height * 4 * (1 + scale * scale) * 1.15 + 2 * MIB)
+    budget = min(int(budget_mib * MIB), available - reserve)
+    if budget < pair:
+        raise RuntimeError(f'Для ОДНОЙ пары кадров нужен бюджет примерно {pair/MIB:.0f} МиБ. '
+                           f'Доступный бюджет {max(0, budget)/MIB:.0f} МиБ. '
+                           'Увеличьте --cache-mb/освободите диск или используйте модель fast с x2/x3.')
+    count = max(1, min(120, budget // pair))
+    if requested:
+        count = min(count, requested)
+    return int(count), pair
+
+
+def free_check(path, needed, reserve):
+    free = shutil.disk_usage(path).free
+    if free < needed + reserve:
+        raise RuntimeError(f'Мало места на {path}: свободно {free/GIB:.2f} ГиБ, '
+                           f'нужно ещё {needed/GIB:.2f} ГиБ + резерв {reserve/GIB:.2f} ГиБ. '
+                           'Обработка остановлена, кэш будет удалён.')
+
+
+def tail(path):
+    try:
+        with Path(path).open('rb') as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 6000))
+            return f.read().decode('utf-8', 'replace')
+    except OSError:
+        return ''
+
+
+def read_exact(stream, n, eof_ok=False):
+    chunks = bytearray()
+    while len(chunks) < n:
+        block = stream.read(n - len(chunks))
+        if not block:
+            if eof_ok and not chunks:
+                return None
+            raise RuntimeError('Оборванный PNG-поток FFmpeg')
+        chunks.extend(block)
+    return bytes(chunks)
+
+
+def read_png_to(stream, path, max_bytes):
+    """Read one PNG, never buffering a complete frame in Python RAM."""
+    sig = read_exact(stream, 8, eof_ok=True)
+    if sig is None:
+        return False
+    if sig != PNG_SIG:
+        raise RuntimeError('FFmpeg вернул не PNG')
+    size = 8
+    with path.open('wb') as out:
+        out.write(sig)
+        while True:
+            header = read_exact(stream, 8)
+            length, kind = struct.unpack('>I4s', header)
+            size += 12 + length
+            if size > max_bytes:
+                raise RuntimeError('PNG превысил расчётный размер кэша')
+            out.write(header)
+            remaining = length + 4  # data + CRC
+            while remaining:
+                n = min(remaining, MIB)
+                out.write(read_exact(stream, n))
+                remaining -= n
+            if kind == b'IEND':
+                return True
+
+
+def encoder_options(args):
+    live = args.live
+    if args.codec == 'h265':
+        params = f'pools={args.threads}:frame-threads={1 if live else 2}:rc-lookahead={0 if live else 12}'
+        if live:
+            params += ':bframes=0'
+        result = ['-c:v', 'libx265', '-preset', args.encode_preset, '-crf', str(args.crf),
+                  '-x265-params', params, '-tag:v', 'hvc1', '-pix_fmt', 'yuv420p']
+        if live:
+            result += ['-tune', 'zerolatency']
+        return result
+    if args.codec == 'nvenc':
+        result = ['-c:v', 'h264_nvenc', '-preset', 'p4', '-rc', 'vbr', '-cq', str(args.crf),
+                  '-b:v', '0', '-pix_fmt', 'yuv420p']
+        if live:
+            result += ['-bf', '0', '-rc-lookahead', '0', '-zerolatency', '1']
+        return result
+    result = ['-c:v', 'libx264', '-preset', args.encode_preset, '-crf', str(args.crf),
+              '-threads', str(args.threads), '-x264-params',
+              'ref=2:rc-lookahead=' + ('0' if live else '12'), '-pix_fmt', 'yuv420p']
+    if live:
+        result += ['-tune', 'zerolatency', '-bf', '0']
+    return result
+
+
+def output_args(args, media):
+    result = encoder_options(args)
+    if media['audio']:
+        result += ['-c:a', 'aac', '-b:a', '192k', '-af', 'apad', '-shortest']
+    else:
+        result += ['-an']
+    if args.live:
+        # Initialization is written first; each complete moof+mdat is playable
+        # without a final moov pass. No full-file rewrite and no second copy.
+        result += ['-movflags', '+empty_moov+default_base_moof+frag_keyframe+negative_cts_offsets',
+                   '-frag_duration', '1000000', '-flush_packets', '1',
+                   '-force_key_frames', 'expr:gte(t,n_forced*2)']
+    result += ['-max_muxing_queue_size', '1024', '-colorspace', 'bt709']
+    return result
+
+
+def base_filters(media, args, for_ai=False):
+    filters = []
+    if media['interlaced'] or args.preset == 'restore':
+        filters.append('yadif=mode=send_frame:deint=interlaced')
+    if for_ai:
+        filters += [f"scale={media['width']}:{media['height']}:flags=bicubic", 'setsar=1',
+                    f"fps={media['rate']}"]
+    return filters
+
+
+def run_fast(src, media, partial, args, ff, work, progress):
+    w, h = dimensions(args.target, media)
+    filters = base_filters(media, args)
+    denoise, sharp = PRESETS[args.preset]
+    if denoise:
+        filters += [f'hqdn3d={denoise}:{denoise*0.8}:{denoise*4}:{denoise*3}']
+    filters += [f'scale={w}:{h}:flags=lanczos:out_color_matrix=bt709', 'setsar=1']
+    if sharp:
+        filters += [f'unsharp=5:5:{sharp}:3:3:0']
+    if args.fps and args.fps > media['fps'] + 0.5:
+        # Interpolate before upscale would be faster, but here favor final quality.
+        filters += [f'minterpolate=fps={args.fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir']
+    filters += ['format=yuv420p']
+    cmd = [ff, '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+           '-threads', str(args.threads), '-filter_threads', '2']
+    if args.preview:
+        cmd += ['-t', str(args.preview)]
+    cmd += ['-i', str(src), '-map', f"0:{media['index']}", '-map', '0:a?', '-sn', '-dn',
+            '-vf', ','.join(filters)]
+    cmd += output_args(args, media) + ['-progress', 'pipe:1', '-nostats', str(partial)]
+    log = work / 'fast.log'
+    progress.stage('Быстрый апскейл')
+    with log.open('wb') as errors, child(cmd, stdout=subprocess.PIPE, stderr=errors) as p:
+        for line in iter(p.stdout.readline, b''):
+            text = line.decode('ascii', 'replace').strip()
+            if text.startswith('frame='):
+                progress.update(int(number(text.split('=', 1)[1])))
+            elif text.startswith('out_time='):
+                free_check(partial.parent, 0, int(args.reserve_gb * GIB))
+        rc = p.wait()
+    if rc:
+        raise RuntimeError('FFmpeg:\n' + tail(log))
+
+
+def run_ai(src, media, partial, args, ff, work, progress):
+    exe, models = ai_tools()
+    w, h = dimensions(args.target, media)
+    scale = ai_scale(media, w, h, args.model)
+    if scale * media['width'] < w or scale * media['height'] < h:
+        warn('Цель выше максимального AI-масштаба; остаток увеличит Lanczos.')
+    model = MODELS[args.model][0]
+    required = ([f'{model}-x{scale}.param', f'{model}-x{scale}.bin']
+                if args.model == 'fast' else [f'{model}.param', f'{model}.bin'])
+    for name in required:
+        if not (Path(models) / name).is_file():
+            raise RuntimeError('Нет файла модели: ' + str(Path(models) / name))
+    reserve = int(args.reserve_gb * GIB)
+    nmax, pair = cache_plan(media['width'], media['height'], scale, args.cache_mb,
+                           shutil.disk_usage(work).free, reserve, args.chunk)
+    say(f'  AI x{scale}; кэш до {args.cache_mb:g} МиБ; порция до {nmax} кадров '
+        f'(консервативно {pair/MIB:.1f} МиБ/пара).')
+    say('  После каждой порции PNG кодируются в ОДИН MP4 и немедленно удаляются.')
+    say('  VFR нормализуется к CFR ' + media['rate'] + ' fps; исходные VFR-таймстампы не сохраняются.')
+    ins, outs = work / 'in', work / 'out'
+    ins.mkdir()
+    outs.mkdir()
+    # Both processes live throughout the file. OS pipes provide backpressure;
+    # decoder cannot silently fill the disk while GPU works.
+    decode = [ff, '-nostdin', '-hide_banner', '-loglevel', 'error', '-threads', str(args.threads),
+              '-filter_threads', '2', '-i', str(src), '-map', f"0:{media['index']}", '-an', '-sn', '-dn']
+    if args.preview:
+        decode += ['-t', str(args.preview)]
+    decode += ['-vf', ','.join(base_filters(media, args, True)), '-fps_mode', 'passthrough',
+               '-c:v', 'png', '-threads:v', '1', '-pix_fmt', 'rgb24', '-compression_level', '1',
+               '-f', 'image2pipe', 'pipe:1']
+    encode = [ff, '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+              '-threads', '1', '-filter_threads', '2', '-f', 'image2pipe', '-framerate', media['rate'],
+              '-probesize', '32', '-analyzeduration', '0', '-fpsprobesize', '0',
+              '-c:v', 'png', '-i', 'pipe:0']
+    if media['audio']:
+        encode += ['-i', str(src), '-map', '0:v:0', '-map', '1:a?']
+    else:
+        encode += ['-map', '0:v:0']
+    # -fps does not pretend to interpolate on the AI path.
+    encode += ['-vf', f'scale={w}:{h}:flags=lanczos:out_color_matrix=bt709,setsar=1,format=yuv420p',
+               '-fps_mode', 'passthrough']
+    encode += output_args(args, media) + [str(partial)]
+    dec_log, enc_log, ai_log = work / 'decode.log', work / 'encode.log', work / 'ai.log'
+    frames, ended = 0, False
+    with dec_log.open('wb') as dl, enc_log.open('wb') as el, \
+            child(decode, stdout=subprocess.PIPE, stderr=dl, bufsize=0) as dec, \
+            child(encode, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=el, bufsize=0) as enc:
+        while not ended:
+            if enc.poll() is not None:
+                raise RuntimeError('Кодировщик остановился:\n' + tail(enc_log))
+            free_check(work, pair, reserve)
+            free_check(partial.parent, 0, reserve)
+            # Shrink next batch as the growing result consumes disk space.
+            batch, _ = cache_plan(media['width'], media['height'], scale, args.cache_mb,
+                                  shutil.disk_usage(work).free, reserve, nmax)
+            progress.stage('Извлечение', f'порция от кадра {frames+1}')
+            got = []
+            for i in range(batch):
+                path = ins / f'f_{i:08d}.png'
+                if not read_png_to(dec.stdout, path, pair):
+                    ended = True
+                    break
+                got.append(path)
+            if not got:
                 break
-        fs = max(24, h // 14)
-        cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
-               "-ss", f"{t:.3f}", "-i", str(src_path),
-               "-ss", f"{t:.3f}", "-i", str(out_path),
-               "-filter_complex",
-               f"[0:v]scale=-2:{h}:flags=lanczos,drawtext=text='ДО':x=20:y=20:"
-               f"fontsize={fs}:fontcolor=white:box=1:boxcolor=black@0.55{font}[l];"
-               f"[1:v]scale=-2:{h}:flags=lanczos,drawtext=text='ПОСЛЕ':x=20:y=20:"
-               f"fontsize={fs}:fontcolor=white:box=1:boxcolor=black@0.55{font}[r];"
-               f"[l][r]hstack=inputs=2[v]",
-               "-map", "[v]", "-frames:v", "1", "-q:v", "2", str(dest)]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
-                           creationflags=(subprocess.CREATE_NO_WINDOW if IS_WIN else 0))
-        if r.returncode == 0 and dest.exists():
-            return dest
-        # drawtext может быть недоступен — пробуем без подписей
-        cmd2 = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
-                "-ss", f"{t:.3f}", "-i", str(src_path),
-                "-ss", f"{t:.3f}", "-i", str(out_path),
-                "-filter_complex",
-                f"[0:v]scale=-2:{h}[l];[1:v]scale=-2:{h}[r];[l][r]hstack=inputs=2[v]",
-                "-map", "[v]", "-frames:v", "1", "-q:v", "2", str(dest)]
-        r2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=300,
-                            creationflags=(subprocess.CREATE_NO_WINDOW if IS_WIN else 0))
-        if r2.returncode == 0 and dest.exists():
-            return dest
-    except Exception:
-        pass
-    return None
+            progress.stage('AI', f'порция {frames+1}–{frames+len(got)}')
+            command = [exe, '-i', str(ins), '-o', str(outs), '-m', models, '-n', model,
+                       '-s', str(scale), '-t', str(args.tile), '-j', args.jobs, '-f', 'png']
+            if args.gpu is not None:
+                command += ['-g', str(args.gpu)]
+            with ai_log.open('wb') as al, child(command, stdout=al, stderr=subprocess.STDOUT) as ai:
+                while True:
+                    try:
+                        rc = ai.wait(timeout=.3)
+                        break
+                    except subprocess.TimeoutExpired:
+                        # An existing output PNG may still be in the middle of a write.
+                        saved = max(0, min(len(list(outs.glob('*.png')))-1, len(got)))
+                        progress.notice(f'порция {frames+1}–{frames+len(got)} · AI {saved}/{len(got)}')
+            if rc:
+                raise RuntimeError(f'Real-ESRGAN: код {rc}\n' + tail(ai_log))
+            expected = {f.name for f in got}
+            actual = {f.name for f in outs.glob('*.png')}
+            if expected != actual:
+                raise RuntimeError(f'Неполная AI-порция: ожидалось {len(expected)}, получено {len(actual)}')
+            used = sum(f.stat().st_size for f in ins.iterdir()) + sum(f.stat().st_size for f in outs.iterdir())
+            if used > args.cache_mb * MIB:
+                raise RuntimeError('AI-кэш превысил бюджет; обработка остановлена')
+            progress.stage('Кодирование', f'порция {frames+1}–{frames+len(got)}')
+            for original in got:
+                improved = outs / original.name
+                # Unbuffered pipe writes can be partial: loop until ALL bytes sent.
+                try:
+                    with improved.open('rb') as f:
+                        while True:
+                            data = f.read(MIB)
+                            if not data:
+                                break
+                            view = memoryview(data)
+                            while view:
+                                sent = enc.stdin.write(view)
+                                if not sent:
+                                    raise BrokenPipeError('Пустая запись в pipe')
+                                view = view[sent:]
+                except (BrokenPipeError, OSError) as e:
+                    raise RuntimeError('Ошибка передачи в кодировщик: ' + str(e) + '\n' + tail(enc_log)) from e
+                original.unlink()
+                improved.unlink()
+                frames += 1
+                progress.update(frames, sample=False)
+                free_check(partial.parent, 0, reserve)
+            # Commit only a complete end-to-end batch: includes extraction,
+            # model loading, GPU work, PNG writes, pipe backpressure and cleanup.
+            progress.update(frames)
+        rc = dec.wait()
+        if rc:
+            raise RuntimeError('Декодирование:\n' + tail(dec_log))
+        if not frames:
+            raise RuntimeError('Нет кадров')
+        enc.stdin.close()  # EOF flushes the codec and the final MP4 fragment.
+        progress.stage('Завершение')
+        rc = enc.wait()
+        if rc:
+            raise RuntimeError('Кодирование:\n' + tail(enc_log))
+    return frames
 
 
-# ----------------------------------------------------------------------------- #
-#  Имя выходного файла
-# ----------------------------------------------------------------------------- #
-def make_output_path(src: Path, w: int, h: int, engine: str) -> Path:
-    """Готовые видео складываем в папку result/ внутри папки программы."""
-    RESULT_DIR.mkdir(parents=True, exist_ok=True)
-    tag = "AI" if engine == "ai" else "HD"
-    name = f"{src.stem}_{w}x{h}_{tag}.mp4"
-    out = RESULT_DIR / name
-    i = 2
+def collect_inputs(values, recursive=False):
+    result, seen = [], set()
+    for raw in values:
+        p = Path(raw.strip().strip('"').strip("'")).expanduser().resolve()
+        if p.is_dir():
+            found = sorted(p.rglob('*') if recursive else p.iterdir())
+            candidates = [f for f in found if f.is_file() and f.suffix.lower() in EXTS]
+        elif p.is_file():
+            candidates = [p]
+        else:
+            raise ValueError('Не найдено: ' + str(p))
+        for item in candidates:
+            key = os.path.normcase(str(item.resolve()))
+            if key not in seen:
+                result.append(item)
+                seen.add(key)
+    return result
+
+
+def select_indices(text, count):
+    if text.strip().lower() in ('a', 'all', 'все', '*'):
+        return list(range(count))
+    picked = set()
+    for token in re.split(r'[,;\s]+', text.strip()):
+        match = re.fullmatch(r'(\d+)(?:-(\d+))?', token)
+        if not match:
+            raise ValueError('Введите номера, например 1,3,5-8, или «все»')
+        first = int(match[1])
+        last = int(match[2] or first)
+        if not 1 <= first <= last <= count:
+            raise ValueError('Номера за пределами списка')
+        picked.update(range(first - 1, last))
+    return sorted(picked)
+
+
+def unique_output(folder, src, w, h, engine):
+    stem = f'{src.stem}_{w}x{h}_{engine.upper()}'
+    out = folder / (stem + '.mp4')
+    n = 2
     while out.exists():
-        out = RESULT_DIR / f"{src.stem}_{w}x{h}_{tag}_{i}.mp4"
-        i += 1
+        out = folder / f'{stem}_{n}.mp4'
+        n += 1
     return out
 
 
-# ----------------------------------------------------------------------------- #
-#  Обработка одного файла (интерактив)
-# ----------------------------------------------------------------------------- #
-def process_one(path: Path, auto: Optional[dict] = None) -> bool:
-    global FFMPEG, FFPROBE
-    if not FFMPEG:
-        err("FFmpeg не найден — без него программа работать не может.")
-        if IS_WIN and ask_yes("Скачать и установить FFmpeg автоматически?", True):
-            if install_ffmpeg():
-                FFMPEG, FFPROBE = find_ffmpeg()
-        if not FFMPEG:
-            return False
-
-    src = MediaInfo(path)
-    if not src.valid:
-        err(f"Не удалось прочитать видео: {path}")
-        return False
-    src.show()
-
-    auto = auto or {}
-
-    # --- выбор движка ---
-    engine = auto.get("engine")
-    if not engine:
-        ai_ready = bool(RES_EXE and RES_MODELS)
-        opts = [
-            ("1", f"БЫСТРЫЙ — ffmpeg (апскейл + резкость + шумодав + цвет). "
-                  f"{cl('работает всегда', 'green')}"),
-            ("2", f"AI — Real-ESRGAN (нейросеть дорисовывает детали). "
-                  f"{cl('лучшее качество', 'magenta')} "
-                  f"{'' if ai_ready else cl('[не установлен — предложу скачать]', 'yellow')}"),
-        ]
-        c = ask_choice("Какой движок используем?", opts, "1",
-                       "Совет: для фильмов и фото-видео бери AI; если нет видеокарты — БЫСТРЫЙ.")
-        engine = "fast" if c == "1" else "ai"
-
-    # --- целевое разрешение ---
-    tw, th = auto.get("size", (0, 0))
-    if not tw and auto.get("fit_x2"):
-        tw, th = src.width * 2, src.height * 2
-    if not tw:
-        opts = []
-        for key, (w, h, label) in TARGETS.items():
-            if w <= src.width and h <= src.height:
-                continue
-            cur = "  ← текущее" if (w == src.width and h == src.height) else ""
-            opts.append((key, f"{w}×{h}  {label}{cur}"))
-        opts.append(("x2", f"Увеличить в 2 раза  →  {src.width*2}×{src.height*2}"))
-        opts.append(("x3", f"Увеличить в 3 раза  →  {src.width*3}×{src.height*3}"))
-        opts.append(("custom", "Своё разрешение (ввести вручную)"))
-        default = "4k" if any(k == "4k" for k, _ in opts) else (opts[0][0] if opts else "x2")
-        c = ask_choice(f"Куда поднимаем? (сейчас {src.width}×{src.height})", opts, default)
-        if c in TARGETS:
-            tw, th = TARGETS[c][0], TARGETS[c][1]
-        elif c == "x2":
-            tw, th = src.width * 2, src.height * 2
-        elif c == "x3":
-            tw, th = src.width * 3, src.height * 3
-        else:
-            v = ask("Ширина x высота (например 2560x1440)", f"{src.width*2}x{src.height*2}")
-            m = re.match(r"\s*(\d+)\s*[xх*]\s*(\d+)", v.lower())
-            if not m:
-                err("Не понял. Беру 4K.")
-                tw, th = 3840, 2160
-            else:
-                tw, th = int(m.group(1)), int(m.group(2))
-
-    w, h = target_size(src, tw, th, auto.get("fit", "fit"))
-
-    # --- пресет (для быстрого) / модель (для AI) ---
-    preset = PRESETS.get(auto.get("preset", ""), PRESETS["balanced"])
-    model_key = auto.get("model", "")
-    fps_out = auto.get("fps")          # None = спросить, 0 = не менять
-    if fps_out is None:
-        fps_out = 0.0
-    preview_sec = auto.get("preview", 0.0) or 0.0
-
-    if engine == "fast":
-        if not auto.get("preset"):
-            opts = [(k, v["name"]) for k, v in PRESETS.items()]
-            c = ask_choice("Пресет обработки?", opts, "balanced")
-            preset = PRESETS[c]
-        if auto.get("fps") is None:
-            opts = [("0", f"Оставить {src.fps or '?'} fps (быстро)"),
-                    ("30", "Интерполяция до 30 fps"),
-                    ("60", "Интерполяция до 60 fps (плавно, но МЕДЛЕННО)")]
-            c = ask_choice("Повысить плавность (fps)?", opts, "0",
-                           "minterpolate считает движение между кадрами — на 4K это долго.")
-            fps_out = {"0": 0.0, "30": 30.0, "60": 60.0}[c]
-    else:
-        if not RES_EXE or not RES_MODELS:
-            warn("AI-движок ещё не установлен.")
-            if not (IS_WIN and ask_yes("Скачать Real-ESRGAN + модели (~45 МБ)?", True)
-                    and install_realesrgan()):
-                warn("Переключаюсь на БЫСТРЫЙ движок.")
-                engine = "fast"
-        if engine == "ai":
-            has_gpu, dev = gpu_is_available()
-            print()
-            if has_gpu:
-                ok(f"Видеокарта найдена: {cl(dev, 'green')}")
-            else:
-                warn(f"Быстрая видеокарта (Vulkan) не найдена: {dev}")
-                warn("AI-обработка без видеокарты будет ОЧЕНЬ медленной.")
-                if auto.get("engine") == "ai":
-                    warn("Но раз движок AI выбран явно — продолжаю с AI, как просили.")
-                elif not preview_sec and ask_yes("Всё равно попробовать AI?", False):
-                    pass
-                else:
-                    info("Переключаюсь на БЫСТРЫЙ движок (он тоже даёт хорошую картинку).")
-                    engine = "fast"
-        if engine == "ai":
-            if not model_key:
-                opts = [(k, v["name"]) for k, v in AI_MODELS.items()]
-                model_key = ask_choice("Какая модель нейросети?", opts, "general")
-            if not preview_sec:
-                if ask_yes("Сделать сначала тестовый фрагмент 5 секунд?", True):
-                    preview_sec = 5.0
-
-    out = auto.get("out") or make_output_path(src.path, w, h, engine)
-    if preview_sec and not auto.get("out"):
-        RESULT_DIR.mkdir(parents=True, exist_ok=True)
-        out = RESULT_DIR / f"{src.path.stem}_{w}x{h}_AI_превью.mp4"
-
-    # --- подтверждение ---
-    print()
-    hr("─", 74, "dim")
-    print(f"  {cl('Итог:', 'bold')} {src.width}×{src.height}  →  "
-          f"{cl(f'{w}×{h}', 'green', 'bold')}   "
-          f"движок: {cl('AI Real-ESRGAN' if engine == 'ai' else 'Быстрый (ffmpeg)', 'cyan')}")
-    print(f"  {cl('Файл:', 'bold')} {out}")
-    est = src.duration * (0.35 if engine == "fast" else 1)
-    print(f"  {cl('Оценка времени:', 'bold')} ~{fmt_time(max(est, 5))}"
-          + (" (AI — сильно зависит от видеокарты)" if engine == "ai" else ""))
-    hr("─", 74, "dim")
-    if not auto.get("yes"):
-        if not ask_yes("Запускаем?", True):
-            warn("Отменено.")
-            return False
-
-    t0 = time.time()
+def process(src, args, ff, ffprobe, out):
+    media = inspect(src, ffprobe)
+    if media['hdr']:
+        raise RuntimeError('HDR PQ/HLG: сначала нужен корректный HDR→SDR tone mapping.')
+    w, h = dimensions(args.target, media)
+    if args.engine == 'ai' and args.fps:
+        raise ValueError('--fps поддерживается только в fast')
+    out = out.resolve()
+    if out == src.resolve() or out.exists():
+        raise ValueError('Выходной файл уже существует или совпадает с исходником: ' + str(out))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    cache = Path(args.cache_dir).expanduser().resolve()
+    cache.mkdir(parents=True, exist_ok=True)
+    free_check(out.parent, 0, int(args.reserve_gb * GIB))
+    # Exclusive create reserves OUR filename; no rename while a player holds it.
+    with out.open('xb'):
+        pass
+    work = None
+    watcher = None
+    success = False
+    start = time.monotonic()
     try:
-        if engine == "ai":
-            good = run_ai_engine(src, out, w, h, model_key or "general",
-                                 crf=17, threads="1:2:2", preview_sec=preview_sec)
+        work = Path(tempfile.mkdtemp(prefix='upscaler_', dir=cache))
+        info(f'{media["width"]}×{media["height"]} → {w}×{h}; {media["rate"]} fps')
+        info('Результат: ' + str(out))
+        if args.live:
+            info('Живой MP4: можно открыть после записи первого фрагмента.')
+            watcher = LiveWatch(out, args.open_live)
+            watcher.start()
+        with ConsoleProgress(frame_goal(media, args), args.engine) as progress:
+            if args.engine == 'ai':
+                frames = run_ai(src, media, out, args, ff, work, progress)
+            else:
+                run_fast(src, media, out, args, ff, work, progress)
+                frames = None
+            progress.stage('Проверка MP4')
+            final = inspect(out, ffprobe)
+            if (final['stream']['width'], final['stream']['height']) != (w, h):
+                raise RuntimeError('Проверка результата: неверное разрешение')
+            if out.stat().st_size < 1000:
+                raise RuntimeError('Результат слишком мал')
+            actual = number(final['stream'].get('nb_frames'))
+            if frames and actual and actual != frames:
+                raise RuntimeError(f'Потеря кадров: отправлено {frames}, в результате {actual}')
+        success = True
+        ok(f'ГОТОВО: {out.stat().st_size/GIB:.2f} ГиБ; {(time.monotonic()-start)/60:.1f} мин')
+    except BaseException:
+        if work:
+            diagnostics = '\n'.join(f'--- {p.name} ---\n{tail(p)}' for p in work.glob('*.log'))
+            if diagnostics.strip():
+                with contextlib.suppress(OSError):
+                    out.with_suffix('.error.log').write_text(diagnostics, encoding='utf-8')
+        raise
+    finally:
+        if watcher:
+            watcher.close()
+        if not success:
+            kept = False
+            if args.live:
+                with contextlib.suppress(OSError):
+                    boundary = playable_end(out)
+                    if boundary:
+                        with out.open('r+b') as f:
+                            f.truncate(boundary)
+                        kept = True
+                        out.with_suffix('.incomplete.txt').write_text(
+                            'Обработка НЕ ЗАВЕРШЕНА. MP4 содержит только записанные фрагменты.\n'
+                            'Кэш удалён; автоматического возобновления нет.\n', encoding='utf-8')
+                        warn('Обработка не завершена. Доступная для просмотра часть оставлена: ' + str(out))
+            if not kept:
+                with contextlib.suppress(OSError):
+                    out.unlink()
+        if work:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def parser():
+    p = argparse.ArgumentParser(description='Видео-апскейлер: исходное меню, ограниченный кэш, живой MP4')
+    p.add_argument('--version', action='version', version='VideoUpscaler '+__version__)
+    p.add_argument('input', nargs='*', help='несколько файлов и/или папок')
+    p.add_argument('--engine', '-e', choices=['fast', 'ai'], default='fast')
+    p.add_argument('--target', '-t', default='4k', help='720/1080/1440/4k/8k/x2/x3/x4/2560x1440')
+    p.add_argument('--model', '-m', choices=list(MODELS), default='general')
+    p.add_argument('--preset', '-p', choices=list(PRESETS), default='balanced')
+    p.add_argument('--cache-mb', type=float, default=512, help='бюджет PNG-кэша, МиБ (по умолчанию 512)')
+    p.add_argument('--cache-dir', default=str(BASE / 'temp'), help='можно указать другой диск')
+    p.add_argument('--chunk', type=int, default=0, help='дополнительный лимит кадров порции; 0=авто')
+    p.add_argument('--reserve-gb', type=float, default=0.5, help='резерв места, ГиБ')
+    p.add_argument('--tile', type=int, default=0, help='AI tile: 0=авто, 128/256 при нехватке VRAM')
+    p.add_argument('--jobs', default='1:2:2', help='потоки NCNN load:proc:save')
+    p.add_argument('--gpu', type=int, default=None, help='индекс Vulkan GPU')
+    p.add_argument('--codec', choices=['h264', 'h265', 'nvenc'], default='h264')
+    p.add_argument('--crf', type=int, default=18, help='CRF/CQ: больше = меньше файл, ниже качество')
+    p.add_argument('--encode-preset', choices=['ultrafast', 'superfast', 'veryfast', 'faster', 'fast',
+                    'medium', 'slow'], default='fast')
+    p.add_argument('--threads', type=int, default=min(8, os.cpu_count() or 2))
+    p.add_argument('--preview', type=float, default=0, help='только первые N секунд; 0=всё')
+    p.add_argument('--fps', type=float, default=0, help='интерполяция, только fast, медленно')
+    p.add_argument('--out', '-o', help='выходной MP4 (только для одного входа)')
+    p.add_argument('--output-dir', default=str(BASE / 'result'))
+    p.add_argument('--recursive', action='store_true', help='искать видео в подпапках')
+    p.add_argument('--select', help='номера из списка файлов: 1,3,5-8 или все')
+    p.add_argument('--batch', action='store_true', help='совместимость: папки и так обрабатываются очередью')
+    p.add_argument('--yes', '-y', action='store_true')
+    p.add_argument('--no-preview', action='store_true', help='не создавать кадр ДО/ПОСЛЕ')
+    p.add_argument('--no-live', dest='live', action='store_false', default=True,
+                   help='обычный MP4 вместо просматриваемого во время обработки')
+    p.add_argument('--open-live', action='store_true', help='открыть MP4 после первого готового фрагмента')
+    p.add_argument('--check-gpu', action='store_true', help='проверить Vulkan/GPU и выйти')
+    p.add_argument('--install-ffmpeg', action='store_true')
+    p.add_argument('--install-ai', action='store_true')
+    return p
+
+
+def validate(args):
+    for key in ('cache_mb', 'reserve_gb', 'preview', 'fps'):
+        value = getattr(args, key)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(key + ' должен быть конечным неотрицательным числом')
+    if args.cache_mb <= 0 or args.threads < 1 or not 0 <= args.crf <= 51:
+        raise ValueError('cache-mb > 0, threads >= 1, crf от 0 до 51')
+    if args.chunk < 0 or args.tile < 0 or (args.tile and args.tile < 32):
+        raise ValueError('chunk >= 0, tile = 0 или >= 32')
+    if not re.fullmatch(r'[1-9]\d*:[1-9]\d*:[1-9]\d*', args.jobs):
+        raise ValueError('--jobs: три положительных числа, например 1:2:2')
+
+
+# ----------------------------------------------------------------------------- #
+# Исходный консольный интерфейс: оформление и пункты 1–6 сохранены.
+# Новые пункты добавлены, а не заменяют привычное меню.
+# ----------------------------------------------------------------------------- #
+C = {
+    'reset': '\033[0m', 'bold': '\033[1m', 'dim': '\033[2m',
+    'red': '\033[91m', 'green': '\033[92m', 'yellow': '\033[93m',
+    'blue': '\033[94m', 'magenta': '\033[95m', 'cyan': '\033[96m', 'white': '\033[97m',
+}
+if os.environ.get('NO_COLOR') or not sys.stdout.isatty():
+    C = {key: '' for key in C}
+
+
+def cl(text, *styles):
+    return ''.join(C.get(s, '') for s in styles) + str(text) + C['reset']
+
+
+def hr(ch='─', n=74, color='dim'):
+    say(cl(ch*n, color))
+
+
+def title(text):
+    hr('═')
+    say(cl(text, 'bold', 'cyan'))
+    hr('═')
+
+
+def ok(text):
+    say('  ' + cl('✓', 'green') + ' ' + str(text))
+
+
+def warn(text):
+    if _ACTIVE_PROGRESS is not None and not _ACTIVE_PROGRESS.closed:
+        _ACTIVE_PROGRESS.warning(text)
+    else:
+        say('  ' + cl('!', 'yellow') + ' ' + cl(text, 'yellow'))
+
+
+def err(text):
+    say('  ' + cl('✗', 'red') + ' ' + cl(text, 'red'))
+
+
+def info(text):
+    say('  ' + cl('·', 'blue') + ' ' + str(text))
+
+
+def fmt_time(seconds):
+    seconds = max(0, int(seconds or 0))
+    h, m, s = seconds//3600, seconds//60 % 60, seconds % 60
+    return f'{h}:{m:02d}:{s:02d}' if h else f'{m:02d}:{s:02d}'
+
+
+def human(n):
+    for unit in ('Б', 'КБ', 'МБ', 'ГБ'):
+        if n < 1024:
+            return f'{n:.1f} {unit}'
+        n /= 1024
+    return f'{n:.1f} ТБ'
+
+
+def ask(prompt, default=''):
+    suffix = ' ' + cl('['+str(default)+']', 'dim') if default != '' else ''
+    try:
+        value = input('  '+cl(prompt, 'bold')+suffix+' > ').strip()
+    except EOFError:
+        return str(default)
+    return value or str(default)
+
+
+def ask_choice(prompt, options, default='1', note=None):
+    say('')
+    say('  '+cl(prompt, 'bold', 'cyan'))
+    for key, label in options:
+        mark = cl('►', 'green') if key == default else ' '
+        say('   '+mark+' '+cl('['+key+']', 'yellow')+' '+label)
+    if note:
+        say('     '+cl(note, 'dim'))
+    while True:
+        value = ask('Выбор', default).lower()
+        if value in [key for key, _ in options]:
+            return value
+        err('Введи одну из: '+', '.join(key for key, _ in options))
+
+
+def ask_yes(prompt, default=False):
+    while True:
+        value = ask(prompt+(' (Y/n)' if default else ' (y/N)')).lower()
+        if not value:
+            return default
+        if value in ('y', 'yes', 'д', 'да', '1', '+'):
+            return True
+        if value in ('n', 'no', 'н', 'нет', '0', '-'):
+            return False
+        err('Ответь y (да) или n (нет)')
+
+
+# ----------------------------------------------------------------------------- #
+# One animated terminal line. ETA uses measured end-to-end batch/frame throughput.
+# No per-frame log spam; redirected stdout gets start/end summaries only.
+# ----------------------------------------------------------------------------- #
+ANSI_RE = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
+
+
+def plain_text(text):
+    return ANSI_RE.sub('', str(text)).replace('\r', ' ').replace('\n', ' ')
+
+
+def text_width(text):
+    return sum(0 if unicodedata.combining(ch) else
+               2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1 for ch in text)
+
+
+def fit_text(text, columns):
+    result, used = [], 0
+    for ch in text:
+        width = text_width(ch)
+        if used+width > columns:
+            break
+        result.append(ch)
+        used += width
+    return ''.join(result)
+
+
+class ETAEstimator:
+    """Smoothed seconds/frame, based on complete batches, including I/O and reloads.
+
+    We intentionally do not infer completed frames from NCNN's percentage lines:
+    they restart for each image/tile and would give a misleading global ETA.
+    """
+    def __init__(self, total, now=None):
+        self.total = max(0, int(total or 0))
+        self.started = time.monotonic() if now is None else now
+        self.last_at = self.started
+        self.done = 0
+        self.seconds_per_frame = None
+        self.samples = 0
+        self.last_interval = 0.0
+
+    def update(self, done, now=None):
+        now = time.monotonic() if now is None else now
+        done = max(self.done, int(done))
+        delta = done-self.done
+        if not delta:
+            return
+        elapsed = max(.001, now-self.last_at)
+        observed = elapsed/delta
+        if self.seconds_per_frame is None or self.samples == 1:
+            # The first interval also includes one-off decoder/GPU initialization.
+            # Once a second full interval exists, bootstrap from steady-state work
+            # rather than predicting that one-off startup cost for every frame.
+            self.seconds_per_frame = observed
         else:
-            good = run_fast_engine(src, out, w, h, preset, fps_out)
-    except KeyboardInterrupt:
-        print()
-        warn("Прервано (Ctrl+C).")
+            # Time-based smoothing: adapt over ~20 seconds, rather than jumping
+            # to the speed of the last frame. Long batches still get useful weight.
+            alpha = min(.85, max(.08, 1-math.exp(-elapsed/20)))
+            self.seconds_per_frame += alpha*(observed-self.seconds_per_frame)
+        self.done = done
+        self.last_at = now
+        self.last_interval = elapsed
+        self.samples += 1
+
+    @property
+    def fps(self):
+        return 1/self.seconds_per_frame if self.seconds_per_frame else 0.0
+
+    def remaining(self, now=None):
+        now = time.monotonic() if now is None else now
+        if not self.total or self.done >= self.total:
+            return None
+        if (self.samples < 2 or self.done < 4 or now-self.started < 3
+                or self.seconds_per_frame is None):
+            return None
+        idle = max(0, now-self.last_at)
+        # A long stall invalidates the old forecast: do not display fake 00:00.
+        if idle > max(15, self.last_interval*2.5):
+            return None
+        seconds = (self.total-self.done)*self.seconds_per_frame-idle
+        return seconds if seconds >= 1 else None
+
+
+def frame_goal(media, args):
+    duration = media['duration']
+    if args.preview:
+        duration = min(duration, args.preview) if duration else args.preview
+    rate = args.fps if args.engine == 'fast' and args.fps > media['fps']+.5 else media['fps']
+    known = number(media.get('stream', {}).get('nb_frames'))
+    if known > 0 and not args.preview and abs(rate-media['fps']) < .001:
+        # For CFR sources trust the stream count; VFR -> CFR needs a duration estimate.
+        nominal = number(media.get('stream', {}).get('r_frame_rate'))
+        if nominal and abs(nominal-media['fps']) < .01:
+            return int(known)
+    return max(1, math.ceil(duration*rate-1e-6)) if duration > 0 else 0
+
+
+class ConsoleProgress:
+    SPINNER = ('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
+
+    def __init__(self, total, label='Обработка', stream=None):
+        self.stream = stream if stream is not None else sys.stdout
+        self.tty = bool(getattr(self.stream, 'isatty', lambda: False)())
+        self.label = label
+        self.stage_name = 'Подготовка'
+        self.total = max(0, int(total or 0))
+        self.done = 0
+        self.detail = ''
+        self.live = False
+        self.estimator = ETAEstimator(self.total)
+        self.lock = threading.RLock()
+        self.event = threading.Event()
+        self.thread = None
+        self.closed = False
+        self.success = False
+        self.warnings = []
+
+    def __enter__(self):
+        global _ACTIVE_PROGRESS
+        with _OUTPUT_LOCK:
+            if _ACTIVE_PROGRESS is not None:
+                raise RuntimeError('Внутренняя ошибка: две строки прогресса одновременно')
+            _ACTIVE_PROGRESS = self
+        self.render()
+        if self.tty:
+            self.thread = threading.Thread(target=self.loop, daemon=True)
+            self.thread.start()
+        return self
+
+    def stage(self, name, detail=''):
+        with self.lock:
+            self.stage_name = plain_text(name)
+            self.detail = plain_text(detail)
+
+    def notice(self, text):
+        text = plain_text(text).strip()
+        if text:
+            with self.lock:
+                self.detail = text
+
+    def warning(self, text):
+        text = plain_text(text)
+        with self.lock:
+            self.detail = text
+            if text not in self.warnings:
+                self.warnings.append(text)
+
+    def mark_live(self):
+        with self.lock:
+            self.live = True
+
+    def update(self, frames, sample=True):
+        with self.lock:
+            self.done = max(self.done, int(frames))
+            if sample:
+                self.estimator.update(self.done)
+
+    def snapshot(self, width=120, now=None):
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            elapsed = max(0, now-self.estimator.started)
+            spinner = '✓' if self.success else ('■' if self.closed else self.SPINNER[int(elapsed*8)%len(self.SPINNER)])
+            percent = min(99.9, self.done/max(1, self.total)*100) if self.total else 0
+            if self.success:
+                percent = 100
+            eta = self.estimator.remaining(now)
+            remaining = '~'+fmt_time(math.ceil(eta)) if eta is not None else 'считаю…'
+            if not self.total:
+                remaining = 'неизвестно'
+            if self.stage_name in ('Завершение', 'Проверка MP4'):
+                remaining = 'завершаю…'
+            if self.closed:
+                remaining = 'готово' if self.success else 'остановлено'
+            speed = ((f'{self.estimator.fps:.2f} fps' if self.estimator.fps < 1 else
+                      f'{self.estimator.fps:.1f} fps') if self.estimator.fps else '— fps')
+            bar_width = 16 if width >= 115 else (10 if width >= 85 else 5)
+            filled = min(bar_width, int(bar_width*percent/100))
+            bar = '█'*filled+'░'*(bar_width-filled)
+            stage = 'Готово' if self.success else self.stage_name
+            lead = spinner+(' MP4' if self.live else '')
+            core = f' {lead} {stage} [{bar}] {percent:5.1f}% | {speed} | осталось {remaining}'
+            if width < 78 or text_width(core) > width-1:
+                core = f' {lead} {percent:5.1f}% | {speed} | осталось {remaining}'
+            if width < 50:
+                core = f' {lead} {percent:4.1f}% | ETA {remaining}'
+            extras = []
+            if self.total:
+                extras.append(f'{self.done}/{self.total} кадр.')
+            extras.append('прошло '+fmt_time(elapsed))
+            if self.live:
+                extras.append('MP4 можно смотреть')
+            if self.detail and not self.closed:
+                extras.append(self.detail)
+            for extra in extras:
+                candidate = core+' | '+extra
+                if text_width(candidate) <= width-1:
+                    core = candidate
+                elif extra == self.detail:
+                    room = width-1-text_width(core)-3
+                    if room >= 8:
+                        core += ' | '+fit_text(extra, room)
+            return fit_text(core, max(1, width-1))
+
+    def render(self, final=False):
+        width = shutil.get_terminal_size((120, 25)).columns if self.tty else 160
+        line = self.snapshot(width)
+        with _OUTPUT_LOCK:
+            if self.tty:
+                # Clear and redraw one physical line; never wrap at terminal edge.
+                self.stream.write('\r\033[2K'+cl(line, 'green' if self.success else 'cyan'))
+                if final:
+                    self.stream.write('\n')
+            else:
+                # A logfile is not a terminal: do not write a line every 125 ms.
+                self.stream.write(line+'\n')
+            self.stream.flush()
+
+    def loop(self):
+        while not self.event.wait(.125):
+            self.render()
+
+    def __exit__(self, kind, value, tb):
+        global _ACTIVE_PROGRESS
+        self.event.set()
+        if self.thread:
+            self.thread.join(timeout=2)
+        with self.lock:
+            self.closed = True
+            self.success = kind is None
+        # Logging errors must not mask a processing exception.
+        try:
+            self.render(final=True)
+        finally:
+            with _OUTPUT_LOCK:
+                _ACTIVE_PROGRESS = None
+        for warning in self.warnings:
+            say('  '+cl('! '+warning, 'yellow'))
         return False
 
-    dt = time.time() - t0
-    print()
-    if good and preview_sec and engine == "ai":
-        ok(f"Тестовый фрагмент готов: {cl(str(out), 'dim')}")
-        info("Посмотри его и кадр «сравнение» — так будет выглядеть всё видео.")
-        interactive = sys.stdin.isatty()
-        if interactive and ask_yes("Обработать теперь ВСЁ видео с этими настройками?", True):
-            a2 = dict(auto)
-            a2.update({"preview": 0.0, "yes": True, "engine": "ai",
-                       "model": model_key or "general", "size": (tw, th),
-                       "out": None})
-            return process_one(path, a2)
-        if not interactive:
-            info("Неинтерактивный режим: полный прогон не запускаю. "
-                 "Убери --preview, чтобы обработать всё видео сразу.")
-        return True
-    if good:
-        fin = MediaInfo(out)
-        title("ГОТОВО!")
-        ok(f"Файл: {cl(str(out), 'bold', 'green')}")
-        info(f"Разрешение: {fin.width}×{fin.height}   Размер: {human(out.stat().st_size)}"
-             f"   Время обработки: {fmt_time(dt)}")
-        if not auto.get("no_preview"):
-            cmp_img = make_comparison(src.path, out)
-            if cmp_img:
-                ok(f"Кадр «ДО | ПОСЛЕ»: {cl(str(cmp_img), 'dim')}")
-        if IS_WIN:
-            if ask_yes("Открыть папку с результатом?", False):
-                try:
-                    subprocess.Popen(["explorer", "/select,", str(out)])
-                except Exception:
-                    pass
-        return True
-    err("Что-то пошло не так. Файл не создан.")
-    return False
 
 
-# ----------------------------------------------------------------------------- #
-#  Пакетная обработка
-# ----------------------------------------------------------------------------- #
-def process_batch(folder: Path, auto: dict) -> None:
-    vids = sorted([f for f in folder.iterdir()
-                   if f.is_file() and f.suffix.lower() in VIDEO_EXTS])
-    if not vids:
-        err("Видео в папке не найдено.")
-        return
-    print()
-    title(f"Пакетная обработка · {len(vids)} файл(ов)")
-    for i, v in enumerate(vids, 1):
-        print()
-        print(cl(f"  ── [{i}/{len(vids)}] {v.name} " + "─" * 20, "bold", "blue"))
-        a = dict(auto)
-        a["yes"] = True
-        try:
-            process_one(v, a)
-        except Exception as e:
-            err(f"Сбой на {v.name}: {e}")
-    print()
-    ok("Пакетная обработка завершена.")
-
-
-# ----------------------------------------------------------------------------- #
-#  Главное меню
-# ----------------------------------------------------------------------------- #
-BANNER = r"""
+BANNER = r'''
  ██╗   ██╗██╗██████╗ ███████╗ █████╗  ██████╗
  ██║   ██║██║██╔══██╗██╔════╝██╔══██╗██╔════╝
  ██║   ██║██║██║  ██║█████╗  ███████║██║
  ╚██╗ ██╔╝██║██║  ██║██╔══╝  ██╔══██║██║
   ╚████╔╝ ██║██████╔╝███████╗██║  ██║╚██████╗
    ╚═══╝  ╚═╝╚═════╝ ╚══════╝╚═╝  ╚═╝ ╚═════╝
-"""
+'''
+PRESET_NAMES = {
+    'soft': 'Мягкий (естественно, без «перешарпа»)',
+    'balanced': 'Сбалансированный (рекомендуется)',
+    'max': 'Максимальная резкость и чистота',
+    'restore': 'Реставрация старого/шумного видео (VHS, DVD, камера)',
+}
+MODEL_NAMES = {
+    'general': 'Универсальная — фильм/сериал/видео с камеры',
+    'anime': 'Аниме / мультфильмы (чистые линии)',
+    'fast': 'Быстрая — animevideov3 (прежде всего для аниме)',
+}
 
 
-def show_status() -> None:
-    print(cl(BANNER, "cyan"))
-    print(cl("   А П С Е Й Л Е Р   В И Д Е О   ·   бесплатно и без ограничений", "bold"))
-    print(cl("   улучшение качества и повышение разрешения до 4K / 8K", "dim"))
-    print()
-    if FFMPEG:
-        ok(f"FFmpeg: {cl(FFMPEG, 'dim')}")
-    else:
-        err("FFmpeg: НЕ НАЙДЕН  (программа предложит установить)")
-    if RES_EXE and RES_MODELS:
-        ok(f"AI Real-ESRGAN: {cl(RES_EXE, 'dim')}")
-    else:
-        warn("AI Real-ESRGAN: не установлен (можно скачать из меню, ~45 МБ)")
+def show_status(args):
+    say(cl(BANNER, 'cyan'))
+    say(cl('   А П С Е Й Л Е Р   В И Д Е О   ·   бесплатно и без ограничений', 'bold'))
+    say(cl('   улучшение качества и повышение разрешения до 4K / 8K · v'+__version__, 'dim'))
+    say('')
     try:
-        import cv2  # noqa: F401
-        ok("OpenCV: установлен")
-    except Exception:
-        info("OpenCV: не установлен (не обязателен)")
-    print()
+        ff, _ = tools()
+        ok('FFmpeg: '+cl(ff, 'dim'))
+    except RuntimeError:
+        err('FFmpeg / FFprobe: НЕ НАЙДЕНЫ (установка — пункт 3)')
+    try:
+        exe, _ = ai_tools()
+        ok('AI Real-ESRGAN: '+cl(exe, 'dim'))
+    except RuntimeError:
+        warn('AI Real-ESRGAN: не установлен (установка — пункт 4)')
+    info(f'Кэш: до {args.cache_mb:g} МиБ; '+cl(args.cache_dir, 'dim'))
+    info('Просмотр во время обработки: '+cl('ВКЛЮЧЁН' if args.live else 'выключен', 'green'))
+    say('')
 
 
-def main_menu() -> None:
-    show_status()
+def show_media(path, media):
+    say('')
+    hr()
+    say(f'  {cl("Файл:", "bold")}        {path.name}')
+    say(f'  {cl("Папка:", "bold")}       {cl(path.parent, "dim")}')
+    say(f'  {cl("Разрешение:", "bold")}  {cl(str(media["width"])+"×"+str(media["height"]), "magenta")}')
+    say(f'  {cl("Длительность:", "bold")} {fmt_time(media["duration"])}   '
+        f'{cl("FPS:", "bold")} {media["fps"]:.3f}   {cl("Размер:", "bold")} {human(path.stat().st_size)}')
+    say(f'  {cl("Кодек:", "bold")}       {media["stream"].get("codec_name", "?")} / '
+        f'{media["stream"].get("pix_fmt", "?")}   {cl("Звук:", "bold")} '+('есть' if media['audio'] else 'нет'))
+    hr()
+
+
+def pick_file():
+    say('')
+    say(cl('  Перетащи видеофайл (или папку с видео) прямо в это окно и нажми Enter.', 'dim'))
+    say(cl('  Либо введи полный путь. Пустая строка — выход.', 'dim'))
     while True:
-        opts = [
-            ("1", cl("Улучшить видео", "bold", "green") + "  — открыть файл или папку"),
-            ("2", "Пакетная обработка папки (все видео сразу)"),
-            ("3", "Установить / обновить FFmpeg"),
-            ("4", "Установить AI-движок Real-ESRGAN (нейросеть)"),
-            ("5", "Проверить видеокарту (Vulkan) и готовность AI"),
-            ("6", "Открыть папку программы"),
-            ("0", cl("Выход", "red")),
-        ]
-        c = ask_choice("ГЛАВНОЕ МЕНЮ", opts, "1")
-        if c == "0":
-            print()
-            print(cl("  Пока! Хорошего качества картинке 😉", "bold", "cyan"))
-            return
-        elif c == "1":
-            p = pick_file()
-            if p is None:
+        raw = ask('Файл / папка')
+        if not raw:
+            return []
+        try:
+            files = collect_inputs([raw])
+            if not files:
+                err('Видео не найдено.')
                 continue
-            if p.is_dir():
-                process_batch(p, {})
-            else:
-                process_one(p)
-        elif c == "2":
-            raw = ask("Папка с видео (можно перетащить её в окно)", "")
-            if not raw:
-                continue
-            p = clean_path(raw)
-            if p.is_dir():
-                process_batch(p, ask_settings())
-            elif p.is_file():
-                process_one(p, {})
-            else:
-                err("Папка не найдена.")
-        elif c == "3":
-            global FFMPEG, FFPROBE
-            if FFMPEG:
-                ok(f"Уже установлен: {FFMPEG}")
-                if not ask_yes("Переустановить?", False):
-                    continue
-            install_ffmpeg()
-            FFMPEG, FFPROBE = find_ffmpeg()
-        elif c == "4":
-            if RES_EXE:
-                ok(f"Уже установлен: {RES_EXE}")
-                if not ask_yes("Переустановить?", False):
-                    continue
-            install_realesrgan()
-        elif c == "5":
-            print()
-            if not RES_EXE:
-                warn("AI-движок не установлен — сначала пункт 4.")
-                continue
-            has, dev = gpu_is_available()
-            if has:
-                ok(f"Видеокарта готова к AI: {cl(dev, 'green')}")
-                info("Можно смело брать движок AI — будет быстро.")
-            else:
-                err(f"Подходящего Vulkan-устройства нет: {dev}")
-                info("Рекомендую БЫСТРЫЙ движок. AI на процессоре = очень медленно.")
-        elif c == "6":
-            if IS_WIN:
+            if len(files) == 1:
+                return files
+            say('')
+            say('  '+cl('В папке найдено видео:', 'bold'))
+            for i, path in enumerate(files, 1):
+                say(f'    {cl("["+str(i)+"]", "yellow")} {path.name}')
+            info('Можно выбрать несколько: 1,3,5-8. «a» — обработать ВСЕ файлы.')
+            while True:
                 try:
-                    os.startfile(str(BASE_DIR))  # type: ignore[attr-defined]
-                except Exception:
-                    pass
+                    return [files[i] for i in select_indices(ask('Выбор', '1'), len(files))]
+                except ValueError as exc:
+                    err(str(exc))
+        except (ValueError, OSError) as exc:
+            err(str(exc))
+
+
+def pick_multiple():
+    root = None
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        names = filedialog.askopenfilenames(title='Выберите видео: Ctrl/Shift + щелчок',
+                    filetypes=[('Видео', ' '.join('*'+e for e in sorted(EXTS))), ('Все файлы', '*')])
+        return collect_inputs(names)
+    except Exception as exc:
+        warn('Окно выбора недоступно: '+str(exc))
+        info('Вводи пути по одному. Пустая строка завершит список.')
+        values = []
+        while True:
+            value = ask('Файл / папка')
+            if not value:
+                break
+            values.append(value)
+        return collect_inputs(values)
+    finally:
+        if root:
+            root.destroy()
+
+
+def gpu_is_available():
+    try:
+        ff, _ = tools()
+        exe, models = ai_tools()
+        with tempfile.TemporaryDirectory(prefix='gpu_check_') as folder:
+            inp, out = Path(folder)/'test.png', Path(folder)/'out.png'
+            subprocess.run([ff, '-v', 'error', '-f', 'lavfi', '-i', 'color=black:s=32x32',
+                            '-frames:v', '1', str(inp)], check=True, capture_output=True, timeout=30)
+            result = subprocess.run([exe, '-i', str(inp), '-o', str(out), '-n', 'realesrgan-x4plus',
+                                     '-m', models, '-s', '4'], capture_output=True, timeout=120,
+                                    encoding='utf-8', errors='replace')
+            text = result.stdout+'\n'+result.stderr
+            match = re.search(r'\[\d+\s+([^\]]+)\]', text)
+            dev = match[1].strip() if match else 'имя устройства не сообщено'
+            if result.returncode or not out.exists():
+                return False, 'AI-тест не прошёл: '+text[-1500:]
+            soft = any(k in text.lower() for k in ('llvmpipe', 'softpipe', 'swrast', 'software rasterizer'))
+            return not soft, dev+(' (программный Vulkan)' if soft else '')
+    except Exception as exc:
+        return False, str(exc)
+
+
+def ask_settings_ui(defaults, files, probe):
+    args = copy.deepcopy(defaults)
+    first = inspect(files[0], probe)
+    if len(files) == 1:
+        show_media(files[0], first)
+    else:
+        title(f'Пакетная обработка · {len(files)} файл(ов)')
+        info('Настройки применяются ко всей очереди. x2/x3 считаются отдельно для каждого видео.')
+    choice = ask_choice('Какой движок используем?', [
+        ('1', 'БЫСТРЫЙ — ffmpeg (апскейл + резкость + шумодав). '+cl('без AI', 'green')),
+        ('2', 'AI — Real-ESRGAN (нейросеть дорисовывает детали). '+cl('нужен Vulkan', 'magenta'))], '1')
+    args.engine = 'fast' if choice == '1' else 'ai'
+    options = [(key, f'{w}×{h}  '+name) for key, (w, h), name in [
+        ('720', TARGETS['720'], 'HD 720p'), ('1080', TARGETS['1080'], 'Full HD 1080p'),
+        ('1440', TARGETS['1440'], '2K QHD 1440p'), ('4k', TARGETS['4k'], '4K UHD 2160p'),
+        ('8k', TARGETS['8k'], '8K UHD 4320p')]]
+    options += [('x2', 'Увеличить в 2 раза'), ('x3', 'Увеличить в 3 раза'), ('custom', 'Своё разрешение')]
+    args.target = ask_choice('Куда поднимаем?', options, '4k')
+    if args.target == 'custom':
+        while True:
+            value = ask('Ширина x высота (например 2560x1440)', '2560x1440')
+            try:
+                dimensions(value, first)
+                args.target = value
+                break
+            except ValueError as exc:
+                err(str(exc))
+    if args.engine == 'fast':
+        args.preset = ask_choice('Пресет обработки?', list(PRESET_NAMES.items()), 'balanced')
+        args.fps = float(ask_choice('Повысить плавность (fps)?', [
+            ('0', f'Оставить исходную частоту (сейчас {first["fps"]:.3f} fps)'),
+            ('30', 'Интерполяция до 30 fps'), ('60', 'Интерполяция до 60 fps — МЕДЛЕННО')], '0'))
+    else:
+        try:
+            ai_tools()
+        except RuntimeError:
+            warn('AI-движок ещё не установлен.')
+            if WIN and ask_yes('Скачать Real-ESRGAN + модели?', True):
+                install('ai')
             else:
-                info(str(BASE_DIR))
-        print()
+                raise RuntimeError('Установи Real-ESRGAN через пункт 4 или выбери БЫСТРЫЙ движок.')
+        args.model = ask_choice('Какая модель нейросети?', list(MODEL_NAMES.items()), 'general')
+        if ask_yes('Сделать сначала тестовый фрагмент 5 секунд?', True):
+            args.preview = 5
+    if args.live:
+        args.open_live = ask_yes('Открыть MP4 в плеере, как только будет готов первый фрагмент?', True)
+    args.yes = True
+    return args
+
+
+def advanced_ui(args):
+    while True:
+        choice = ask_choice('КЭШ И ПРОСМОТР — дополнительные настройки', [
+            ('1', f'Бюджет PNG-кэша: {args.cache_mb:g} МиБ'),
+            ('2', 'Папка кэша: '+str(args.cache_dir)),
+            ('3', 'Папка результатов: '+str(args.output_dir)),
+            ('4', 'Живой MP4: '+('ВКЛЮЧЁН' if args.live else 'выключен')),
+            ('5', 'Кодирование: '+args.codec),
+            ('0', 'Назад')], '0')
+        try:
+            if choice == '0':
+                return
+            if choice == '1':
+                candidate = float(ask('МиБ', str(args.cache_mb)))
+                check = copy.deepcopy(args)
+                check.cache_mb = candidate
+                validate(check)
+                args.cache_mb = candidate
+            elif choice == '2':
+                args.cache_dir = ask('Папка кэша', args.cache_dir).strip('"')
+            elif choice == '3':
+                args.output_dir = ask('Папка результатов', args.output_dir).strip('"')
+            elif choice == '4':
+                args.live = ask_yes('Делать MP4 просматриваемым во время обработки?', True)
+            elif choice == '5':
+                args.codec = ask_choice('Кодек', [('h264', 'H.264 — совместимость'),
+                    ('h265', 'H.265 — обычно меньше файл, но медленнее'),
+                    ('nvenc', 'NVIDIA NVENC — аппаратное H.264')], args.codec)
+        except ValueError as exc:
+            err(str(exc))
+
+
+def make_comparison(src, out, ff, probe):
+    try:
+        si, oi = inspect(src, probe), inspect(out, probe)
+        duration = min(si['duration'], oi['duration'])
+        when = max(0, min(duration*.35, duration-.1))
+        h = min(max(si['height'], 360), 1080)//2*2
+        dest = out.with_name(out.stem+'_сравнение.jpg')
+        graph = f'[0:v]scale=-2:{h}[l];[1:v]scale=-2:{h}[r];[l][r]hstack=inputs=2[v]'
+        cmd = [ff, '-v', 'error', '-y', '-ss', str(when), '-i', str(src),
+               '-ss', str(when), '-i', str(out), '-filter_complex_threads', '1',
+               '-filter_complex', graph, '-map', '[v]', '-frames:v', '1', '-q:v', '2', str(dest)]
+        subprocess.run(cmd, check=True, capture_output=True, timeout=120)
+        return dest
+    except Exception:
+        return None
+
+
+def ui_run(files, args, ff, probe):
+    failures = 0
+    for i, src in enumerate(files, 1):
+        say('')
+        say(cl(f'  ── [{i}/{len(files)}] {src.name} '+'─'*20, 'bold', 'blue'))
+        try:
+            media = inspect(src, probe)
+            if len(files) > 1:
+                show_media(src, media)
+            w, h = dimensions(args.target, media)
+            out = unique_output(Path(args.output_dir).expanduser(), src, w, h,
+                                args.engine+('_preview' if args.preview else ''))
+            process(src, args, ff, probe, out)
+            title('ТЕСТОВЫЙ ФРАГМЕНТ ГОТОВ!' if args.preview else 'ГОТОВО!')
+            ok('Файл: '+cl(out, 'bold', 'green'))
+            if not args.no_preview:
+                image = make_comparison(src, out, ff, probe)
+                if image:
+                    ok('Кадр «ДО | ПОСЛЕ» (слева исходник): '+str(image))
+        except KeyboardInterrupt:
+            warn('Прервано (Ctrl+C). Записанные фрагменты сохранены, кэш очищен.')
+            return
+        except Exception as exc:
+            failures += 1
+            err(str(exc))
+    if len(files) > 1:
+        ok(f'Пакетная обработка завершена. Успешно: {len(files)-failures}; ошибок: {failures}.')
+    if args.preview and failures == 0 and ask_yes('Обработать теперь ВСЁ видео с этими настройками?', True):
+        full = copy.deepcopy(args)
+        full.preview = 0
+        ui_run(files, full, ff, probe)
+    elif WIN and ask_yes('Открыть папку с результатом?', False):
+        os.startfile(str(Path(args.output_dir).resolve()))
+
+
+def main_menu(defaults):
+    show_status(defaults)
+    while True:
+        choice = ask_choice('ГЛАВНОЕ МЕНЮ', [
+            ('1', cl('Улучшить видео', 'bold', 'green')+'  — открыть файл или папку'),
+            ('2', 'Пакетная обработка папки (все видео сразу)'),
+            ('3', 'Установить / обновить FFmpeg'),
+            ('4', 'Установить AI-движок Real-ESRGAN (нейросеть)'),
+            ('5', 'Проверить видеокарту (Vulkan) и готовность AI'),
+            ('6', 'Открыть папку программы'),
+            ('7', cl('Выбрать НЕСКОЛЬКО видео', 'green')+' — окно выбора Ctrl/Shift'),
+            ('8', 'Кэш, папки, кодек и просмотр MP4 во время обработки'),
+            ('0', cl('Выход', 'red'))], '1')
+        try:
+            if choice == '0':
+                say(cl('  Пока! Хорошего качества картинке 😉', 'bold', 'cyan'))
+                return 0
+            if choice in ('3', '4'):
+                title('Установка FFmpeg' if choice == '3' else 'Установка AI-движка Real-ESRGAN')
+                if ask_yes('Скачать / переустановить?', True):
+                    install('ffmpeg' if choice == '3' else 'ai')
+                continue
+            if choice == '5':
+                info('Проверяю Vulkan реальным тестовым кадром…')
+                has, dev = gpu_is_available()
+                (ok if has else warn)('Vulkan: '+dev)
+                continue
+            if choice == '6':
+                if WIN:
+                    os.startfile(str(BASE))
+                else:
+                    info(str(BASE))
+                continue
+            if choice == '8':
+                advanced_ui(defaults)
+                continue
+            try:
+                ff, probe = tools()
+            except RuntimeError:
+                if WIN and ask_yes('FFmpeg/FFprobe не найдены. Установить?', True):
+                    install('ffmpeg')
+                    ff, probe = tools()
+                else:
+                    raise
+            if choice == '1':
+                files = pick_file()
+            elif choice == '2':
+                raw = ask('Папка с видео (можно перетащить её в окно)')
+                files = collect_inputs([raw]) if raw else []
+            else:
+                files = pick_multiple()
+            if not files:
+                continue
+            settings = ask_settings_ui(defaults, files, probe)
+            validate(settings)
+            say('')
+            hr()
+            info(f'Итог: {len(files)} видео; движок {settings.engine}; цель {settings.target}')
+            info(f'Кэш до {settings.cache_mb:g} МиБ; живой MP4: '+('да' if settings.live else 'нет'))
+            hr()
+            if ask_yes('Запускаем?', True):
+                ui_run(files, settings, ff, probe)
+        except KeyboardInterrupt:
+            warn('Отменено. Возвращаюсь в меню.')
+        except Exception as exc:
+            err(str(exc))
 
 
 # ----------------------------------------------------------------------------- #
-#  CLI-режим
+# Растущий fragmented MP4: определение готового фрагмента и безопасное сохранение.
 # ----------------------------------------------------------------------------- #
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="upscaler.py",
-        description="Бесплатный апскейлер видео до HD/4K/8K (ffmpeg + Real-ESRGAN AI).",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Примеры:
-  python upscaler.py                                    # интерактивное меню
-  python upscaler.py "D:\\video\\clip.mp4" --target 4k     # быстро, в 4K
-  python upscaler.py clip.mp4 --engine ai --target 1080 # нейросетью в Full HD
-  python upscaler.py clip.mp4 --target x2 --preset max  # увеличить вдвое
-  python upscaler.py "D:\\Папка"  --batch --engine fast --target 4k --yes
-""")
-    p.add_argument("input", nargs="?", help="видеофайл или папка")
-    p.add_argument("--engine", "-e", choices=["fast", "ai"], help="движок")
-    p.add_argument("--target", "-t", default=None,
-                   help="720 | 1080 | 1440 | 4k | 8k | x2 | x3 | ШИРИНАxВЫСОТА")
-    p.add_argument("--preset", "-p", choices=list(PRESETS), default="balanced",
-                   help="пресет быстрого движка")
-    p.add_argument("--model", "-m", choices=list(AI_MODELS), default="general",
-                   help="модель Real-ESRGAN")
-    p.add_argument("--fps", type=float, default=0, help="интерполяция до N fps (0 = не менять)")
-    p.add_argument("--out", "-o", default=None, help="имя выходного файла")
-    p.add_argument("--preview", type=float, default=0,
-                   help="обработать только первые N секунд (тест)")
-    p.add_argument("--no-preview", action="store_true",
-                   help="не создавать кадр «ДО/ПОСЛЕ»")
-    p.add_argument("--batch", action="store_true", help="обработать всю папку")
-    p.add_argument("--yes", "-y", action="store_true", help="без подтверждения")
-    p.add_argument("--install-ffmpeg", action="store_true", help="установить ffmpeg и выйти")
-    p.add_argument("--install-ai", action="store_true", help="установить Real-ESRGAN и выйти")
-    p.add_argument("--check-gpu", action="store_true", help="проверить Vulkan/GPU и выйти")
-    return p
+def playable_end(path):
+    """Last complete top-level moof+mdat, without reading media payload into RAM."""
+    try:
+        size = Path(path).stat().st_size
+        boundary, moov, pending, pos = 0, False, False, 0
+        with Path(path).open('rb') as f:
+            while pos+8 <= size:
+                f.seek(pos)
+                header = f.read(8)
+                if len(header) != 8:
+                    break
+                length, kind = struct.unpack('>I4s', header)
+                header_size = 8
+                if length == 1:
+                    extended = f.read(8)
+                    if len(extended) != 8:
+                        break
+                    length = struct.unpack('>Q', extended)[0]
+                    header_size = 16
+                # size=0 extends to EOF: never treat a growing box as complete.
+                if length < header_size or pos+length > size:
+                    break
+                if kind == b'moov':
+                    moov = True
+                elif kind == b'moof':
+                    pending = True
+                elif kind == b'mdat' and moov and pending:
+                    boundary = pos+length
+                    pending = False
+                pos += length
+        return boundary
+    except (OSError, struct.error):
+        return 0
 
 
-def resolve_target(spec: Optional[str], src: MediaInfo) -> Tuple[int, int]:
-    if not spec:
-        return 3840, 2160
-    s = spec.strip().lower()
-    if s in TARGETS:
-        return TARGETS[s][0], TARGETS[s][1]
-    if s in ("x2", "2x"):
-        return src.width * 2, src.height * 2
-    if s in ("x3", "3x"):
-        return src.width * 3, src.height * 3
-    if s in ("x4", "4x"):
-        return src.width * 4, src.height * 4
-    m = re.match(r"(\d+)\s*[xх*]\s*(\d+)", s)
-    if m:
-        return int(m.group(1)), int(m.group(2))
-    raise ValueError(f"Не понял --target '{spec}'. Варианты: 720 1080 1440 4k 8k x2 x3 2560x1440")
+def open_player(path):
+    if WIN:
+        os.startfile(str(path))
+    else:
+        subprocess.Popen(['open' if sys.platform == 'darwin' else 'xdg-open', str(path)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def main() -> int:
-    ap = build_parser()
-    args = ap.parse_args()
-    purge_temp()          # убираем хвосты от прошлых (прерванных) запусков
+class LiveWatch:
+    def __init__(self, path, auto_open=False):
+        self.path = Path(path)
+        self.auto_open = auto_open
+        self.event = threading.Event()
+        self.ready = False
+        self.thread = threading.Thread(target=self.loop, daemon=True)
 
-    global FFMPEG, FFPROBE, RES_EXE, RES_MODELS
+    def start(self):
+        self.thread.start()
 
-    if args.install_ffmpeg:
-        FFMPEG, FFPROBE = find_ffmpeg()
-        if FFMPEG and FFPROBE:
-            ok(f"FFmpeg уже установлен: {FFMPEG}")
-            return 0
-        return 0 if install_ffmpeg() else 1
-    if args.install_ai:
-        RES_EXE, RES_MODELS = find_realesrgan()
-        return 0 if (RES_EXE or install_realesrgan()) else 1
+    def loop(self):
+        while not self.event.wait(.25):
+            if self.check():
+                return
+
+    def check(self):
+        if self.ready or not playable_end(self.path):
+            return self.ready
+        self.ready = True
+        progress = _ACTIVE_PROGRESS
+        if progress is not None and not progress.closed:
+            progress.mark_live()
+        else:
+            ok('MP4 УЖЕ МОЖНО СМОТРЕТЬ: '+cl(self.path, 'bold', 'green'))
+            info('Пока доступна только записанная часть. Рекомендуется VLC или mpv.')
+        if self.auto_open:
+            try:
+                open_player(self.path)
+            except Exception as exc:
+                warn('Не удалось открыть плеер автоматически: '+str(exc))
+        return True
+
+    def close(self):
+        self.event.set()
+        self.thread.join(timeout=2)
+        self.check()
+
+
+def main(argv=None):
+    ap = parser()
+    args = ap.parse_args(argv)
+    if args.install_ffmpeg or args.install_ai:
+        if args.install_ffmpeg:
+            install('ffmpeg')
+        if args.install_ai:
+            install('ai')
+        return 0
     if args.check_gpu:
         has, dev = gpu_is_available()
-        print(("GPU OK: " if has else "GPU NOT FOUND: ") + dev)
+        say(('GPU OK: ' if has else 'GPU NOT READY: ') + dev)
         return 0 if has else 2
-
     if not args.input:
+        if not sys.stdin.isatty():
+            ap.error('Укажите входные файлы; меню доступно только в терминале')
+        return main_menu(args)
+    files = collect_inputs(args.input, args.recursive)
+    validate(args)
+    if not files:
+        raise ValueError('Нет видео для обработки')
+    if args.select:
+        for i, f in enumerate(files, 1):
+            say(f'{i}. {f}')
+        files = [files[i] for i in select_indices(args.select, len(files))]
+    if args.out and len(files) != 1:
+        raise ValueError('--out допустим только для одного видео; для очереди используйте --output-dir')
+    ff, probe = tools()
+    if args.engine == 'ai':
+        ai_tools()
+    say(f'\nВ очереди: {len(files)} видео. Движок {args.engine}. Настройки общие.')
+    if not args.yes and sys.stdin.isatty():
+        if not ask_yes('Запускаем?', True):
+            return 0
+    failures = 0
+    for i, src in enumerate(files, 1):
+        say(f'\n[{i}/{len(files)}] {src}')
         try:
-            main_menu()
+            media = inspect(src, probe)
+            w, h = dimensions(args.target, media)
+            out = (Path(args.out).expanduser() if args.out else
+                   unique_output(Path(args.output_dir).expanduser(), src, w, h,
+                                 args.engine + ('_preview' if args.preview else '')))
+            process(src, args, ff, probe, out)
         except KeyboardInterrupt:
-            print()
-            warn("Выход (Ctrl+C).")
-        return 0
-
-    src_path = clean_path(args.input)
-    if src_path.is_dir() or args.batch:
-        auto = {
-            "engine": args.engine or "fast",
-            "preset": args.preset,
-            "model": args.model,
-            "fps": args.fps if args.fps else 0.0,
-            "yes": True,
-            "preview": args.preview,
-        }
-        if args.target:
-            # для пакета считаем от первого файла
-            first = next((f for f in src_path.iterdir()
-                          if f.suffix.lower() in VIDEO_EXTS), None)
-            if first:
-                auto["size"] = resolve_target(args.target, MediaInfo(first))
-        process_batch(src_path, auto)
-        return 0
-
-    if not src_path.exists():
-        err(f"Файл не найден: {src_path}")
-        return 1
-
-    src = MediaInfo(src_path)
-    auto = {
-        "engine": args.engine,
-        "preset": args.preset,
-        "model": args.model,
-        "fps": args.fps if args.fps else 0.0,
-        "yes": args.yes,
-        "preview": args.preview,
-        "no_preview": args.no_preview,
-    }
-    if args.target:
-        auto["size"] = resolve_target(args.target, src)
-    if args.out:
-        auto["out"] = Path(args.out)
-    return 0 if process_one(src_path, auto) else 1
+            raise
+        except Exception as exc:
+            failures += 1
+            say('  ОШИБКА: ' + str(exc))
+    say(f'\nОчередь завершена. Успешно: {len(files)-failures}; ошибок: {failures}.')
+    return 1 if failures else 0
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
+    if WIN:
+        os.system('')  # VT colors in Windows console
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(Exception):
+            stream.reconfigure(encoding='utf-8', errors='replace')
+    for name in ('SIGTERM', 'SIGBREAK'):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), terminate)
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        print()
+        for proc in list(ACTIVE):
+            stop(proc)
+        say('\nОстановлено. Дочерние процессы завершены; кэш текущего задания очищен.')
         sys.exit(130)
+    except Exception as exc:
+        say('ОШИБКА: ' + str(exc))
+        sys.exit(1)
